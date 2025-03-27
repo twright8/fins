@@ -8,7 +8,7 @@ document_processing:
 # Models
 models:
   embedding_model: "intfloat/multilingual-e5-base"
-  reranking_model: "mixedbread-ai/mxbai-rerank-xsmall-v1"
+  reranking_model: "BAAI/bge-reranker-v2-m3"
   ner_model: "flair/ner-english-ontonotes-fast"
   coref_model: "maverick-coref"
   llm_model: "Qwen/Qwen2.5-0.5B-Instruct"
@@ -22,16 +22,31 @@ retrieval:
   vector_weight: 0.7
   bm25_weight: 0.3
 
-# LLM Generation (Aphrodite)
+# LLM Generation
 generation:
+  # Common parameters
   temperature: 0.3
   max_tokens: 1024
   top_p: 0.9
   top_k: 50
   presence_penalty: 0.0
-  max_model_len: 8192
-  gpu_memory_utilization: 0.85
-  quantization: "fp8"
+  
+  # Provider selection - can be "aphrodite" or "deepseek"
+  provider: "aphrodite"
+  
+  # Aphrodite (local) configuration
+  aphrodite:
+    model: "Qwen/Qwen2.5-0.5B-Instruct"
+    max_model_len: 8192
+    gpu_memory_utilization: 0.85
+    quantization: "fp8"
+  
+  # DeepSeek API configuration
+  deepseek:
+    api_key: ""  # Add your DeepSeek API key here to enable DeepSeek
+    api_base: "https://api.deepseek.com/v1"
+    model: "deepseek-chat"
+    timeout: 60
 
 # Qdrant Vector DB
 qdrant:
@@ -44,6 +59,7 @@ qdrant:
 entity_extraction:
   confidence_threshold: 0.3
   relationship_threshold: 0.3
+  fuzzy_match_threshold: 90  # Fuzzy matching threshold (0-100) for entity deduplication
 
 # UI
 ui:

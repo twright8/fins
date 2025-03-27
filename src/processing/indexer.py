@@ -141,19 +141,34 @@ class Indexer:
             from rank_bm25 import BM25Okapi
             import nltk
             from nltk.tokenize import word_tokenize
+            from nltk.corpus import stopwords
             
-            # Ensure NLTK tokenizer is available
+            # Ensure NLTK resources are available
             try:
                 nltk.data.find('tokenizers/punkt')
             except LookupError:
                 self._update_status("Downloading NLTK punkt tokenizer")
                 nltk.download('punkt')
             
-            # Tokenize the texts
+            try:
+                nltk.data.find('corpora/stopwords')
+            except LookupError:
+                self._update_status("Downloading NLTK stopwords")
+                nltk.download('stopwords')
+            
+            # Get English stopwords
+            stop_words = set(stopwords.words('english'))
+            
+            # Tokenize and clean the texts
             tokenized_texts = []
             for text in texts:
+                # Tokenize and convert to lowercase
                 tokens = word_tokenize(text.lower())
-                tokenized_texts.append(tokens)
+                
+                # Remove stopwords
+                filtered_tokens = [token for token in tokens if token not in stop_words]
+                
+                tokenized_texts.append(filtered_tokens)
             
             # Create BM25 index
             self.bm25_index = BM25Okapi(tokenized_texts)
@@ -161,10 +176,15 @@ class Indexer:
             # Append metadata to the index
             self.bm25_index.metadata = metadata
             
-            # Save the index
+            # Save the index along with tokenized texts
             bm25_file = self.bm25_dir / "latest_index.pkl"
             with open(bm25_file, 'wb') as f:
                 pickle.dump((self.bm25_index, tokenized_texts, metadata), f)
+            
+            # Also save stopwords for consistent retrieval
+            stop_words_file = self.bm25_dir / "stopwords.pkl"
+            with open(stop_words_file, 'wb') as f:
+                pickle.dump(stop_words, f)
             
             self._update_status(f"BM25 index saved to {bm25_file}", 0.6)
             return True
@@ -188,48 +208,192 @@ class Indexer:
         """
         self._update_status("Loading embedding model via Infinity", 0.6)
         
+        register = None
         try:
             from embed import BatchedInference
             from qdrant_client import QdrantClient, models
             import torch
             import gc
+            import time
+            import os
+            
+            # Log cache location for debugging
+            hf_cache = os.environ.get('HF_HOME', os.path.expanduser('~/.cache/huggingface'))
+            logger.info(f"Using Hugging Face cache directory: {hf_cache}")
+            
+            # Log model loading
+            device = "cuda" if torch.cuda.is_available() else "cpu"
+            logger.info(f"Starting to load Infinity embedding model: {self.embedding_model_name} on {device}...")
+            
+            start_time = time.time()
             
             # Setup Infinity BatchedInference
             register = BatchedInference(
                 model_id=[self.embedding_model_name],
                 engine="torch",
-                device="cuda" if torch.cuda.is_available() else "cpu"
+                device=device
             )
             
+            elapsed_time = time.time() - start_time
+            logger.info(f"Infinity embedding model loaded successfully in {elapsed_time:.2f} seconds")
+            
+            # Generate embeddings for chunks
+            self._update_status(f"Generating embeddings for {len(texts)} chunks", 0.7)
+            
+            # Print directly to console for better visibility
+            print(f"\n[EMBEDDING] Generating embeddings for {len(texts)} chunks with model {self.embedding_model_name}")
+            
+            # Additional debug information
+            print(f"[DEBUG] First few characters of first text: '{texts[0][:50]}...'")
+            
+            # We need to handle a few edge cases in the embed library:
+            # 1. Sometimes it returns integers for very short or empty texts
+            # 2. Sometimes the embedding dimension doesn't match the expected size
+            # 3. Sometimes the embeddings are returned as tensors, sometimes as lists
+            
+            # First remove any empty texts which might cause issues
+            filtered_texts = []
+            filtered_metadata = []
+            for i, text in enumerate(texts):
+                if text and len(text.strip()) > 0:
+                    filtered_texts.append(text)
+                    filtered_metadata.append(metadata[i])
+                else:
+                    print(f"[WARNING] Skipping empty text at position {i}")
+            
+            if len(filtered_texts) < len(texts):
+                print(f"[WARNING] Removed {len(texts) - len(filtered_texts)} empty texts")
+                
+            if not filtered_texts:
+                raise ValueError("No valid texts to embed")
+                
+            texts = filtered_texts
+            metadata = filtered_metadata
+            
             try:
-                # Generate embeddings for chunks
-                self._update_status(f"Generating embeddings for {len(texts)} chunks", 0.7)
+                # Force a token initialization first to ensure model is properly loaded
+                # This can help with some edge cases in infinity-embed
+                print(f"[INFO] Initializing model with a test embedding...")
+                test_future = register.embed(sentences=["This is a test sentence"], model_id=self.embedding_model_name)
+                test_embedding = test_future.result()
+                test_shape = None
+                if isinstance(test_embedding, list) and len(test_embedding) > 0:
+                    if hasattr(test_embedding[0], 'shape'):
+                        test_shape = test_embedding[0].shape
+                    elif hasattr(test_embedding[0], '__len__'):
+                        test_shape = len(test_embedding[0])
+                print(f"[INFO] Test embedding completed successfully. Shape: {test_shape}")
+                
+                # For small number of texts, process in a single batch
+                # (infinity-embed typically returns a list of numpy arrays)
+                print(f"[INFO] Processing {len(texts)} texts using model {self.embedding_model_name}")
+                
+                # Let's try with a longer timeout to ensure completion
                 future = register.embed(sentences=texts, model_id=self.embedding_model_name)
-                embeddings = future.result()  # Blocks until completion
+                embeddings = future.result()  # This returns a list of numpy arrays
                 
-                # Connect to Qdrant
-                self._update_status(f"Connecting to Qdrant ({self.qdrant_host}:{self.qdrant_port})", 0.8)
-                client = QdrantClient(host=self.qdrant_host, port=self.qdrant_port)
+                # Debug information
+                print(f"[DEBUG] Embeddings result type: {type(embeddings)}")
                 
-                # Create collection if it doesn't exist
-                collections = client.get_collections().collections
-                collection_names = [c.name for c in collections]
+                # Handle the special case where embeddings is a tuple (reported in the error)
+                if isinstance(embeddings, tuple):
+                    print(f"[WARNING] Embeddings returned as a tuple with {len(embeddings)} elements")
+                    # Check if the first element is a list of embeddings (common scenario)
+                    if len(embeddings) > 0 and isinstance(embeddings[0], list) and len(embeddings[0]) > 0:
+                        print(f"[INFO] Extracting embeddings from first element of tuple")
+                        embeddings = embeddings[0]
                 
-                if self.qdrant_collection not in collection_names:
-                    self._update_status(f"Creating collection: {self.qdrant_collection}")
-                    client.create_collection(
-                        collection_name=self.qdrant_collection,
-                        vectors_config=models.VectorParams(
-                            size=self.vector_size,
-                            distance=models.Distance.COSINE
-                        )
+                if embeddings and len(embeddings) > 0:
+                    print(f"[DEBUG] First embedding type: {type(embeddings[0])}")
+                    if hasattr(embeddings[0], 'shape'):
+                        print(f"[DEBUG] First embedding shape: {embeddings[0].shape}")
+                    elif hasattr(embeddings[0], '__len__'):
+                        print(f"[DEBUG] First embedding length: {len(embeddings[0])}")
+                    else:
+                        print(f"[DEBUG] First embedding value: {str(embeddings[0])[:100]}")
+                
+                # Check if the embeddings might be in a transposed format
+                # (e.g., one embedding of dimension [num_texts] instead of [num_texts] embeddings of dimension [vector_size])
+                if len(embeddings) == self.vector_size and len(texts) != self.vector_size:
+                    print(f"[WARNING] Embeddings appear to be in transposed format. Attempting to fix.")
+                    # Use first embedding as a test
+                    if hasattr(embeddings[0], '__len__') and len(embeddings[0]) == len(texts):
+                        # This suggests we have vector_size embeddings of dimension num_texts
+                        # Instead of num_texts embeddings of dimension vector_size
+                        # We need to transpose
+                        try:
+                            import numpy as np
+                            embeddings_array = np.array(embeddings)
+                            embeddings = embeddings_array.T.tolist()
+                            print(f"[INFO] Successfully transposed embeddings from shape ({len(embeddings)}, {len(embeddings[0])}) to ({len(embeddings[0])}, {len(embeddings)})")
+                        except Exception as transpose_error:
+                            print(f"[ERROR] Failed to transpose embeddings: {transpose_error}")
+                
+                # Verify we got the expected number of embeddings
+                if len(embeddings) != len(texts):
+                    print(f"[WARNING] Expected {len(texts)} embeddings but got {len(embeddings)}")
+                
+            except Exception as embed_error:
+                print(f"\n[ERROR] Embedding generation failed with error: {embed_error}")
+                print(f"[ERROR] Full traceback:")
+                import traceback
+                traceback.print_exc()
+                
+                # Try a fallback approach with smaller batches if we have more than a few texts
+                if len(texts) > 4:
+                    print(f"[INFO] Attempting fallback: processing in smaller batches")
+                    try:
+                        embeddings = []
+                        batch_size = max(1, len(texts) // 4)  # Split into 4 batches or individual texts
+                        
+                        for i in range(0, len(texts), batch_size):
+                            batch_end = min(i + batch_size, len(texts))
+                            batch = texts[i:batch_end]
+                            print(f"[INFO] Processing batch {i//batch_size + 1}/4: {len(batch)} texts")
+                            
+                            batch_future = register.embed(sentences=batch, model_id=self.embedding_model_name)
+                            batch_embeddings = batch_future.result()
+                            
+                            # Check batch format and fix if needed
+                            if isinstance(batch_embeddings, tuple) and len(batch_embeddings) > 0:
+                                batch_embeddings = batch_embeddings[0]
+                                
+                            # Append to overall embeddings list
+                            embeddings.extend(batch_embeddings)
+                            
+                        print(f"[INFO] Successfully processed {len(embeddings)} embeddings in batches")
+                    except Exception as batch_error:
+                        print(f"[ERROR] Batch fallback also failed: {batch_error}")
+                        traceback.print_exc()
+                        raise embed_error  # Raise the original error
+                else:
+                    raise
+            
+            # Connect to Qdrant
+            self._update_status(f"Connecting to Qdrant ({self.qdrant_host}:{self.qdrant_port})", 0.8)
+            client = QdrantClient(host=self.qdrant_host, port=self.qdrant_port)
+            
+            # Create collection if it doesn't exist
+            collections = client.get_collections().collections
+            collection_names = [c.name for c in collections]
+            
+            if self.qdrant_collection not in collection_names:
+                self._update_status(f"Creating collection: {self.qdrant_collection}")
+                client.create_collection(
+                    collection_name=self.qdrant_collection,
+                    vectors_config=models.VectorParams(
+                        size=self.vector_size,
+                        distance=models.Distance.COSINE
                     )
-                
-                # Prepare points for upsert
-                self._update_status(f"Preparing points for Qdrant", 0.9)
-                points = []
-                
-                for i, embedding in enumerate(embeddings):
+                )
+            
+            # Prepare points for upsert
+            self._update_status(f"Preparing points for Qdrant", 0.9)
+            print(f"[DEBUG] Preparing {len(embeddings)} points for Qdrant")
+            points = []
+            
+            for i, embedding in enumerate(embeddings):
+                try:
                     # Generate a unique Qdrant ID for this point
                     # Use chunk_id from metadata if available, otherwise generate one
                     chunk_id = metadata[i].get('chunk_id', str(uuid.uuid4()))
@@ -240,28 +404,108 @@ class Indexer:
                         **metadata[i]
                     }
                     
+                    # Check for scalar values that should be skipped
+                    if isinstance(embedding, (int, float)):
+                        print(f"[ERROR] Embedding {i} is a scalar value ({embedding}), not a vector. Skipping.")
+                        continue
+                    
+                    # Best case: it's a numpy array with proper shape
+                    if hasattr(embedding, 'shape') and len(embedding.shape) == 1:
+                        # Perfect - numpy array with proper shape
+                        if embedding.shape[0] == self.vector_size:
+                            vector_data = embedding.tolist()
+                        else:
+                            print(f"[ERROR] Numpy array dimension mismatch: got {embedding.shape[0]}, expected {self.vector_size}. Skipping.")
+                            continue
+                    # Handle different embedding formats    
+                    elif hasattr(embedding, 'tolist'):
+                        # It's a tensor or other array-like object
+                        vector_data = embedding.tolist()
+                        if i == 0:
+                            print(f"[DEBUG] Embedding is an array-like that supports tolist()")
+                    elif isinstance(embedding, list):
+                        # It's already a list
+                        vector_data = embedding
+                        if i == 0:
+                            print(f"[DEBUG] Embedding is already a list with {len(vector_data)} elements")
+                    else:
+                        # Unknown format - convert to list safely
+                        if i == 0:
+                            print(f"[DEBUG] Embedding has unexpected type: {type(embedding)}")
+                        try:
+                            # Try to convert to a list if possible
+                            if hasattr(embedding, '__iter__'):
+                                vector_data = list(embedding)
+                            else:
+                                print(f"[ERROR] Embedding {i} is not iterable: {embedding}. Skipping.")
+                                continue
+                        except Exception as e:
+                            print(f"[ERROR] Could not convert embedding {i} to list: {e}")
+                            if i == 0:
+                                print(f"[DEBUG] Embedding representation: {str(embedding)[:100]}...")
+                            print(f"[WARNING] Skipping this embedding instead of failing")
+                            continue
+                            
+                    # Validate vector format and dimensions
+                    if not isinstance(vector_data, list):
+                        print(f"[ERROR] Vector data is not a list after conversion: {type(vector_data)}. Skipping.")
+                        continue
+                        
+                    if len(vector_data) != self.vector_size:
+                        print(f"[ERROR] Vector dimension mismatch: got {len(vector_data)}, expected {self.vector_size}. Skipping.")
+                        continue
+                        
+                    # Validate that all elements are numeric
+                    if not all(isinstance(x, (int, float)) for x in vector_data):
+                        print(f"[ERROR] Vector contains non-numeric elements. Skipping.")
+                        continue
+                    
                     # Create point
                     points.append(
                         models.PointStruct(
                             id=str(chunk_id),
-                            vector=embedding.tolist(),
+                            vector=vector_data,
                             payload=payload
                         )
                     )
+                except Exception as point_error:
+                    print(f"[ERROR] Error creating point {i}: {point_error}")
+                    print(f"[DEBUG] Vector type: {type(embedding)}")
+                    print(f"[DEBUG] Vector sample: {str(embedding)[:100] if hasattr(embedding, '__str__') else 'Cannot display'}")
+                    raise
+            
+            # Check if we have any valid points
+            if not points:
+                error_msg = "No valid embeddings were generated. Vector indexing failed."
+                self._update_status(error_msg, 0.95)
+                logger.error(error_msg)
+                return False
                 
-                # Upsert points to Qdrant
-                self._update_status(f"Upserting {len(points)} points to Qdrant", 0.95)
-                client.upsert(
-                    collection_name=self.qdrant_collection,
-                    points=points,
-                    wait=True
-                )
+            # Log how many points were skipped
+            skipped_count = len(embeddings) - len(points)
+            if skipped_count > 0:
+                logger.warning(f"Skipped {skipped_count} out of {len(embeddings)} points due to invalid embeddings")
+                print(f"[WARNING] Skipped {skipped_count} points due to invalid embeddings")
+            
+            # Upsert points to Qdrant
+            self._update_status(f"Upserting {len(points)} points to Qdrant", 0.95)
+            client.upsert(
+                collection_name=self.qdrant_collection,
+                points=points,
+                wait=True
+            )
+            
+            self._update_status(f"Vector indexing complete: added {len(points)} vectors to collection '{self.qdrant_collection}'", 1.0)
+            return True
                 
-                self._update_status(f"Vector indexing complete", 1.0)
-                return True
-                
-            finally:
-                # Cleanup
+        except Exception as e:
+            error_msg = f"Error creating vector index: {e}"
+            self._update_status(error_msg)
+            logger.error(error_msg)
+            return False
+        finally:
+            # Always ensure cleanup happens
+            if register is not None:
                 self._update_status("Stopping Infinity embedding model")
                 register.stop()
                 del register
@@ -274,9 +518,3 @@ class Indexer:
                 gc.collect()
                 
                 log_memory_usage(logger)
-                
-        except Exception as e:
-            error_msg = f"Error creating vector index: {e}"
-            self._update_status(error_msg)
-            logger.error(error_msg)
-            return False

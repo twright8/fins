@@ -3,6 +3,9 @@ UI components for the Streamlit interface.
 """
 import streamlit as st
 import time
+import math
+import json
+import re
 from typing import List, Dict, Any, Optional, Callable, Tuple
 import pandas as pd
 import plotly.graph_objects as go
@@ -87,15 +90,34 @@ def processing_status(status_queue, process):
     Returns:
         bool: True if processing completed successfully, False otherwise
     """
-    # Create status containers
+    # Create containers for different processing stages
     status_container = st.empty()
-    progress_container = st.empty()
-    details_container = st.empty()
+    main_progress_container = st.empty()
+    stage_info_container = st.empty()
     
-    # Initialize progress bar
-    progress_bar = progress_container.progress(0)
+    # Create columns for stage information
+    col1, col2 = stage_info_container.columns([1, 3])
+    stage_label_container = col1.empty()
+    stage_progress_container = col2.empty()
+    
+    # Initialize status and progress
     status_container.info("Starting document processing...")
+    main_progress = main_progress_container.progress(0)
     
+    # Define processing stages
+    stages = {
+        "Document Loading": 0.0,
+        "Document Chunking": 0.2,
+        "Coreference Resolution": 0.4,
+        "Entity Extraction": 0.6,
+        "Indexing": 0.8
+    }
+    
+    # Track current stage and progress
+    current_stage = "Initializing"
+    stage_progress = 0.0
+    
+    # Initialize success and error tracking
     success = False
     error_message = None
     
@@ -109,22 +131,39 @@ def processing_status(status_queue, process):
                 if msg[0] == 'progress':
                     # Update progress bar
                     progress, status_text = msg[1], msg[2]
-                    progress_bar.progress(float(progress))
-                    details_container.markdown(f"**{status_text}**")
+                    main_progress.progress(float(progress))
+                    
+                    # Determine current stage from progress
+                    for stage, stage_threshold in sorted(stages.items(), key=lambda x: x[1]):
+                        if progress >= stage_threshold:
+                            current_stage = stage
+                    
+                    # Calculate stage-specific progress
+                    next_stages = [v for s, v in stages.items() if v > stages.get(current_stage, 0)]
+                    next_stage_threshold = min(next_stages) if next_stages else 1.0
+                    stage_threshold = stages.get(current_stage, 0)
+                    stage_progress = (progress - stage_threshold) / (next_stage_threshold - stage_threshold)
+                    
+                    # Update stage information
+                    stage_label_container.markdown(f"**{current_stage}:**")
+                    stage_progress_container.progress(min(1.0, max(0.0, stage_progress)))
+                    
+                    # Display detailed status
+                    st.markdown(f"**Status:** {status_text}")
                     
                 elif msg[0] == 'status':
                     # Update status text
-                    details_container.markdown(f"**{msg[1]}**")
+                    st.markdown(f"**{msg[1]}**")
                     
                 elif msg[0] == 'error':
                     # Display error
                     error_message = msg[1]
-                    details_container.error(error_message)
+                    st.error(error_message)
                     
                 elif msg[0] == 'success':
                     # Processing completed successfully
                     success = True
-                    details_container.success(msg[1])
+                    st.success(msg[1])
             
             # Small sleep to prevent CPU hogging
             time.sleep(0.1)
@@ -134,22 +173,24 @@ def processing_status(status_queue, process):
             msg = status_queue.get()
             
             if msg[0] == 'progress':
-                progress_bar.progress(float(msg[1]))
-                details_container.markdown(f"**{msg[2]}**")
+                main_progress.progress(float(msg[1]))
+                st.markdown(f"**Status:** {msg[2]}")
                 
             elif msg[0] == 'error':
                 error_message = msg[1]
-                details_container.error(error_message)
+                st.error(error_message)
                 
             elif msg[0] == 'success':
                 success = True
-                details_container.success(msg[1])
-                progress_bar.progress(1.0)
+                st.success(msg[1])
+                main_progress.progress(1.0)
         
         # Final status update
         if success:
             status_container.success("Document processing completed successfully!")
-            progress_bar.progress(1.0)
+            main_progress.progress(1.0)
+            stage_label_container.markdown("**Complete:**")
+            stage_progress_container.progress(1.0)
         else:
             if error_message:
                 status_container.error(f"Processing failed: {error_message}")
@@ -177,7 +218,18 @@ def document_explorer(documents: List[Dict[str, Any]]):
     """, unsafe_allow_html=True)
     
     if not documents:
-        st.info("No documents have been processed yet. Upload and process documents to see them here.")
+        # Show placeholder with info about BM25 and Vector index
+        st.info("No document metadata available. However, you can still query the system using the documents indexed in BM25 and vector stores.")
+        
+        # Add guidance
+        st.markdown("""
+        ### Available Exploration Options:
+        
+        - **Entities & Relationships**: View extracted entities and relationships in the tab above.
+        - **Query Documents**: Use the conversational interface to ask questions about indexed documents.
+        
+        To view complete document metadata and content in this explorer, upload new documents and ensure metadata is retained during processing.
+        """)
         return
     
     # Create document summary
@@ -191,11 +243,18 @@ def document_explorer(documents: List[Dict[str, Any]]):
             "Relationships": doc.get("relationship_count", 0)
         })
     
-    # Display document summary
+    # Display document summary with improved styling
     st.dataframe(
         pd.DataFrame(doc_summaries),
         hide_index=True,
-        use_container_width=True
+        use_container_width=True,
+        column_config={
+            "Document": st.column_config.TextColumn("Document", width="medium"),
+            "Type": st.column_config.TextColumn("Type", width="small"),
+            "Pages": st.column_config.NumberColumn("Pages", width="small"),
+            "Entities": st.column_config.NumberColumn("Entities", width="small"),
+            "Relationships": st.column_config.NumberColumn("Relationships", width="small")
+        }
     )
     
     # Document selector
@@ -211,18 +270,59 @@ def document_explorer(documents: List[Dict[str, Any]]):
     if selected_doc_data:
         # Display document details
         with st.expander("Document Details", expanded=True):
-            # Document metadata
-            st.markdown(f"**File Name:** {selected_doc_data.get('file_name', 'Unknown')}")
-            st.markdown(f"**File Type:** {selected_doc_data.get('file_type', 'Unknown').upper()}")
+            # Document metadata in a card-like container with columns
+            st.markdown("""
+            <style>
+            .metadata-card {
+                border: 1px solid #e0e0e0;
+                border-radius: 10px;
+                padding: 15px;
+                margin-bottom: 20px;
+                background-color: #f8f9fa;
+            }
+            </style>
+            """, unsafe_allow_html=True)
             
-            metadata = selected_doc_data.get("metadata", {})
-            if metadata:
-                st.markdown("#### Metadata")
-                for key, value in metadata.items():
-                    st.markdown(f"**{key}:** {value}")
+            st.markdown("<div class='metadata-card'>", unsafe_allow_html=True)
+            col1, col2 = st.columns(2)
             
-            # Document content
+            with col1:
+                st.markdown(f"**File Name:** {selected_doc_data.get('file_name', 'Unknown')}")
+                st.markdown(f"**File Type:** {selected_doc_data.get('file_type', 'Unknown').upper()}")
+                
+                # Add additional type-specific details
+                file_type = selected_doc_data.get('file_type', '').lower()
+                if file_type == 'pdf':
+                    page_count = len(selected_doc_data.get("content", []))
+                    st.markdown(f"**Page Count:** {page_count}")
+                elif file_type in ['csv', 'excel']:
+                    metadata = selected_doc_data.get("metadata", {})
+                    if 'row_count' in metadata:
+                        st.markdown(f"**Rows:** {metadata['row_count']}")
+                    if 'column_count' in metadata:
+                        st.markdown(f"**Columns:** {metadata['column_count']}")
+            
+            with col2:
+                metadata = selected_doc_data.get("metadata", {})
+                if metadata:
+                    filtered_metadata = {k: v for k, v in metadata.items() 
+                                       if k not in ['row_count', 'column_count']}
+                    
+                    for key, value in filtered_metadata.items():
+                        # Format the key name for better display
+                        display_key = ' '.join(word.capitalize() for word in key.split('_'))
+                        st.markdown(f"**{display_key}:** {value}")
+            
+            st.markdown("</div>", unsafe_allow_html=True)
+            
+            # Document content with search capability
             st.markdown("#### Content")
+            
+            # Text search box
+            search_term = st.text_input(
+                "Search within document",
+                placeholder="Enter search term..."
+            )
             
             content = selected_doc_data.get("content", [])
             tabs = st.tabs([f"Page {i+1}" for i in range(len(content))])
@@ -231,12 +331,26 @@ def document_explorer(documents: List[Dict[str, Any]]):
                 with tab:
                     if i < len(content):
                         page_content = content[i].get("text", "")
-                        st.text_area(
-                            f"Content - Page {i+1}",
-                            value=page_content,
-                            height=300,
-                            key=f"page_{i}_{selected_doc}"
-                        )
+                        
+                        # Highlight search terms if provided
+                        if search_term and search_term.strip():
+                            # Add HTML highlighting for search term
+                            pattern = re.compile(f"({re.escape(search_term)})", re.IGNORECASE)
+                            highlighted_content = pattern.sub(r'<span style="background-color: #FFFF00; font-weight: bold;">\1</span>', page_content)
+                            
+                            # Display with highlighted search terms
+                            st.markdown(
+                                f"<div style='height: 300px; overflow-y: auto; border: 1px solid #ccc; padding: 10px; font-family: monospace; white-space: pre-wrap;'>{highlighted_content}</div>",
+                                unsafe_allow_html=True
+                            )
+                        else:
+                            # Regular display without highlighting
+                            st.text_area(
+                                f"Content - Page {i+1}",
+                                value=page_content,
+                                height=300,
+                                key=f"page_{i}_{selected_doc}"
+                            )
 
 def entity_explorer(entities: List[Dict[str, Any]], relationships: List[Dict[str, Any]], callback: Optional[Callable] = None):
     """
@@ -320,12 +434,42 @@ def entity_explorer(entities: List[Dict[str, Any]], relationships: List[Dict[str
             st.info("No relationships available for visualization.")
             return
         
-        # Limit number of entities and relationships for visualization
-        top_entities_count = st.slider("Number of top entities to include", 10, 100, 30)
+        # Create columns for graph controls
+        control_col1, control_col2, control_col3 = st.columns(3)
         
-        # Filter top entities by mention count
+        with control_col1:
+            # Limit number of entities
+            top_entities_count = st.slider("Number of entities", 10, 100, 30)
+        
+        with control_col2:
+            # Filter by entity type
+            entity_types = sorted(list(set(entity.get("type", "unknown") for entity in entities)))
+            selected_graph_types = st.multiselect(
+                "Filter by entity type",
+                options=entity_types,
+                default=entity_types
+            )
+        
+        with control_col3:
+            # Graph physics options
+            physics_enabled = st.checkbox("Enable physics", value=True)
+            if physics_enabled:
+                physics_solver = st.selectbox(
+                    "Physics solver",
+                    options=["forceAtlas2Based", "barnesHut", "repulsion"],
+                    index=0
+                )
+            else:
+                physics_solver = "none"
+        
+        # Filter top entities by mention count and type
+        filtered_entities = [
+            entity for entity in entities
+            if entity.get("type", "unknown") in selected_graph_types
+        ]
+        
         top_entities = sorted(
-            entities,
+            filtered_entities,
             key=lambda e: e.get("mention_count", 1),
             reverse=True
         )[:top_entities_count]
@@ -375,51 +519,160 @@ def entity_explorer(entities: List[Dict[str, Any]], relationships: List[Dict[str
             "unknown": "#9CA3AF"  # Light gray
         }
         
-        # Add nodes with attributes
+        # Add nodes with attributes and improved styling
         for node, attrs in G.nodes(data=True):
-            size = 10 + (attrs.get("weight", 1) * 3)  # Size based on mention count
-            color = colors.get(attrs.get("type", "unknown"), colors["unknown"])
+            entity_type = attrs.get("type", "unknown")
+            mentions = attrs.get("weight", 1)
             
+            # Size based on mention count (logarithmic scaling for better visualization)
+            size = 15 + (10 * math.log(mentions + 1))  
+            
+            # Get color from the type map
+            color = colors.get(entity_type, colors["unknown"])
+            
+            # Create detailed tooltip
+            tooltip = f"""
+            <div style='font-family: Arial; padding: 8px;'>
+                <div style='font-weight: bold; font-size: 14px;'>{node}</div>
+                <div style='margin-top: 5px;'><b>Type:</b> {entity_type.capitalize()}</div>
+                <div><b>Mentions:</b> {mentions}</div>
+                <div style='font-size: 11px; margin-top: 5px;'>Click to view detailed profile</div>
+            </div>
+            """
+            
+            # Add node with enhanced attributes
             net.add_node(
                 node,
                 label=node,
-                title=f"Type: {attrs.get('type', 'unknown')}\nMentions: {attrs.get('weight', 1)}",
+                title=tooltip,
                 size=size,
-                color=color
+                color=color,
+                borderWidth=2,
+                borderWidthSelected=3,
+                font={'size': min(16 + int(math.log(mentions + 1)), 30)}  # Larger font for important entities
             )
         
-        # Add edges with attributes
+        # Add edges with attributes and improved styling
         for source, target, attrs in G.edges(data=True):
-            width = 1 + (attrs.get("confidence", 0) * 5)  # Width based on confidence
+            relation_type = attrs.get("type", "unknown")
+            confidence = attrs.get("confidence", 0)
             
+            # Width based on confidence
+            width = 1 + (confidence * 8)  # More pronounced width difference
+            
+            # Determine edge color (slightly darker than node color)
+            source_type = G.nodes[source].get('type', 'unknown')
+            source_color = colors.get(source_type, colors["unknown"])
+            
+            # Create darker variant for edge color (simple darkening)
+            rgb = source_color.lstrip('#')
+            r, g, b = tuple(int(rgb[i:i+2], 16) for i in (0, 2, 4))
+            edge_color = f"#{max(0, r-30):02x}{max(0, g-30):02x}{max(0, b-30):02x}"
+            
+            # Create detailed tooltip
+            tooltip = f"""
+            <div style='font-family: Arial; padding: 8px;'>
+                <div style='font-weight: bold; margin-bottom: 5px;'>{relation_type.capitalize()}</div>
+                <div><b>From:</b> {source}</div>
+                <div><b>To:</b> {target}</div>
+                <div><b>Confidence:</b> {confidence:.2f}</div>
+            </div>
+            """
+            
+            # Add edge with enhanced attributes
             net.add_edge(
                 source,
                 target,
-                title=f"Type: {attrs.get('type', 'unknown')}\nConfidence: {attrs.get('confidence', 0):.2f}",
-                width=width
+                title=tooltip,
+                width=width,
+                color=edge_color,
+                smooth={'type': 'curvedCW', 'roundness': 0.2},  # Curved edges for better visibility
+                label=relation_type if confidence > 0.6 else ""  # Show labels only for high-confidence relationships
             )
         
-        # Set physics options
-        net.set_options("""
-        {
-          "physics": {
+        # Dynamic physics options based on user selection
+        physics_options = {
             "forceAtlas2Based": {
-              "gravitationalConstant": -50,
-              "centralGravity": 0.01,
-              "springLength": 100,
-              "springConstant": 0.08
+                "gravitationalConstant": -50,
+                "centralGravity": 0.01,
+                "springLength": 100,
+                "springConstant": 0.08
             },
+            "barnesHut": {
+                "gravitationalConstant": -2000,
+                "centralGravity": 0.3,
+                "springLength": 95,
+                "springConstant": 0.04,
+                "damping": 0.09
+            },
+            "repulsion": {
+                "nodeDistance": 100,
+                "centralGravity": 0.2,
+                "springLength": 200,
+                "springConstant": 0.05,
+                "damping": 0.09
+            }
+        }
+        
+        # Build physics configuration
+        physics_config = {
+            "enabled": physics_enabled,
             "maxVelocity": 50,
-            "solver": "forceAtlas2Based",
+            "solver": physics_solver,
             "timestep": 0.35,
             "stabilization": {
-              "enabled": true,
-              "iterations": 1000,
-              "updateInterval": 25
+                "enabled": True,
+                "iterations": 1000,
+                "updateInterval": 25
             }
-          }
         }
-        """)
+        
+        # Add solver-specific options if physics is enabled
+        if physics_enabled and physics_solver in physics_options:
+            physics_config.update(physics_options[physics_solver])
+        
+        # Set options with dynamic physics
+        options = {
+            "physics": physics_config,
+            "interaction": {
+                "hover": True,
+                "navigationButtons": True,
+                "keyboard": {
+                    "enabled": True
+                }
+            },
+            "edges": {
+                "smooth": {
+                    "enabled": True,
+                    "type": "dynamic"
+                },
+                "arrows": {
+                    "to": {
+                        "enabled": True,
+                        "scaleFactor": 0.5
+                    }
+                }
+            },
+            "nodes": {
+                "shape": "dot",
+                "scaling": {
+                    "min": 10,
+                    "max": 30,
+                    "label": {
+                        "enabled": True,
+                        "min": 14,
+                        "max": 24
+                    }
+                },
+                "font": {
+                    "size": 16,
+                    "face": "Arial"
+                }
+            }
+        }
+        
+        # Set the options
+        net.set_options(json.dumps(options))
         
         # Save and display HTML
         html_file = "entity_graph.html"
@@ -435,22 +688,71 @@ def entity_explorer(entities: List[Dict[str, Any]], relationships: List[Dict[str
         if not relationships:
             st.info("No relationships have been extracted.")
             return
+            
+        # Filtering options
+        col1, col2 = st.columns(2)
+        
+        with col1:
+            # Get unique relationship types
+            rel_types = sorted(list(set(rel.get("type", "unknown") for rel in relationships)))
+            selected_rel_types = st.multiselect(
+                "Filter by relationship type",
+                options=rel_types,
+                default=rel_types
+            )
+            
+        with col2:
+            # Entity search field
+            entity_search = st.text_input(
+                "Search by entity name",
+                placeholder="Enter entity name..."
+            )
+            
+            # Configure minimum confidence threshold
+            min_confidence = st.slider(
+                "Minimum confidence",
+                min_value=0.0,
+                max_value=1.0,
+                value=0.0,
+                step=0.05
+            )
+        
+        # Apply filters
+        filtered_relationships = [
+            rel for rel in relationships
+            if rel.get("type", "unknown") in selected_rel_types
+            and rel.get("confidence", 0) >= min_confidence
+            and (not entity_search.strip() or 
+                 entity_search.lower() in rel.get("subject", "").lower() or 
+                 entity_search.lower() in rel.get("object", "").lower())
+        ]
+        
+        # Display relationship count
+        st.markdown(f"**Showing {len(filtered_relationships)} of {len(relationships)} relationships**")
         
         # Create relationship summary
         rel_summaries = []
-        for rel in relationships:
+        for rel in filtered_relationships:
             rel_summaries.append({
                 "Subject": rel.get("subject", "Unknown"),
                 "Relationship": rel.get("type", "Unknown"),
                 "Object": rel.get("object", "Unknown"),
-                "Confidence": f"{rel.get('confidence', 0):.2f}"
+                "Confidence": f"{rel.get('confidence', 0):.2f}",
+                "Document": rel.get("document_id", "Unknown")
             })
         
-        # Display relationship summary
+        # Display relationship summary with enhanced styling
         st.dataframe(
             pd.DataFrame(rel_summaries),
             hide_index=True,
-            use_container_width=True
+            use_container_width=True,
+            column_config={
+                "Subject": st.column_config.TextColumn("Subject", width="medium"),
+                "Relationship": st.column_config.TextColumn("Relationship", width="medium"),
+                "Object": st.column_config.TextColumn("Object", width="medium"),
+                "Confidence": st.column_config.TextColumn("Confidence", width="small"),
+                "Document": st.column_config.TextColumn("Document", width="medium")
+            }
         )
 
 def entity_profile(entity_data: Dict[str, Any], entity_relationships: List[Dict[str, Any]]):
@@ -614,16 +916,46 @@ def chat_interface(query_handler, on_submit=None):
         with st.chat_message(message["role"]):
             st.markdown(message["content"])
             
-            # Display context if available
-            if "context" in message and message["context"]:
-                with st.expander("View Source Context", expanded=False):
-                    for i, ctx in enumerate(message["context"]):
-                        st.markdown(f"**Source {i+1}:** {ctx['metadata'].get('file_name', 'Unknown')}")
-                        if ctx['metadata'].get('page_num'):
-                            st.markdown(f"**Page:** {ctx['metadata'].get('page_num')}")
-                        st.markdown("**Excerpt:**")
-                        st.markdown(ctx['text'])
-                        st.markdown("---")
+            # Display context and copy button if this is an assistant message
+            if message["role"] == "assistant":
+                # Add copy button for response
+                if st.button("📋 Copy Response", key=f"copy_{len(st.session_state.messages)}"):
+                    # Use JavaScript to copy to clipboard
+                    st.markdown(f"""
+                    <script>
+                        navigator.clipboard.writeText(`{message["content"]}`)
+                        .then(() => console.log('Copied to clipboard'))
+                        .catch(err => console.error('Error copying: ', err));
+                    </script>
+                    """, unsafe_allow_html=True)
+                    st.toast("Response copied to clipboard!", icon="✅")
+                
+                # Display context if available
+                if "context" in message and message["context"]:
+                    with st.expander("View Source Context", expanded=False):
+                        for i, ctx in enumerate(message["context"]):
+                            st.markdown(f"**Source {i+1}:** {ctx['metadata'].get('file_name', 'Unknown')}")
+                            if ctx['metadata'].get('page_num'):
+                                st.markdown(f"**Page:** {ctx['metadata'].get('page_num')}")
+                            
+                            # Extract most relevant section from the context
+                            ctx_text = ctx['text']
+                            highlighted_text = ctx_text
+                            
+                            # Simple highlighting for potential answer spans
+                            query_terms = set(message["content"].lower().split())
+                            highlight_terms = [term for term in query_terms if len(term) > 3]  # Skip short words
+                            
+                            if highlight_terms:
+                                # Add HTML highlighting for relevant terms
+                                for term in highlight_terms:
+                                    # Case-insensitive replacement
+                                    pattern = re.compile(re.escape(term), re.IGNORECASE)
+                                    highlighted_text = pattern.sub(f"<mark>{term}</mark>", highlighted_text)
+                            
+                            st.markdown("**Excerpt:**")
+                            st.markdown(highlighted_text, unsafe_allow_html=True)
+                            st.markdown("---")
     
     # Chat input
     if prompt := st.chat_input("Ask a question about your documents..."):
@@ -639,20 +971,37 @@ def chat_interface(query_handler, on_submit=None):
             message_placeholder = st.empty()
             message_placeholder.markdown("Thinking...")
             
-            # Process query
-            with st.spinner("Generating response..."):
-                answer, context = query_handler.process_query(prompt)
-            
-            # Update placeholder with response
-            message_placeholder.markdown(answer)
-            
-            # Add assistant message to chat history
-            st.session_state.messages.append({
-                "role": "assistant",
-                "content": answer,
-                "context": context
-            })
-            
-            # Call onsubmit callback if provided
-            if on_submit:
-                on_submit(prompt, answer, context)
+            try:
+                # Process query
+                with st.spinner("Generating response..."):
+                    answer, context = query_handler.process_query(prompt)
+                
+                # Update placeholder with response
+                message_placeholder.markdown(answer)
+                
+                # Add assistant message to chat history
+                st.session_state.messages.append({
+                    "role": "assistant",
+                    "content": answer,
+                    "context": context
+                })
+                
+                # Call onsubmit callback if provided
+                if on_submit:
+                    on_submit(prompt, answer, context)
+                    
+            except Exception as e:
+                # Handle errors gracefully
+                error_message = f"I encountered an error while processing your query: {str(e)}"
+                message_placeholder.error(error_message)
+                
+                # Add error message to chat history
+                st.session_state.messages.append({
+                    "role": "assistant",
+                    "content": error_message,
+                    "context": []
+                })
+                
+                # Log the error
+                import traceback
+                st.error(traceback.format_exc())

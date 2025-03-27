@@ -24,8 +24,46 @@ class QueryHandler:
         """Initialize query handler with retriever and generator."""
         self.retriever = Retriever()
         self.generator = Generator()
+        self.entities_data = None
+        self.relationships_data = None
+        
+        # Load entity and relationship data
+        self._load_processed_data()
         
         logger.info("QueryHandler initialized")
+    
+    def _load_processed_data(self):
+        """
+        Load entities and relationships from disk into memory.
+        """
+        try:
+            import json
+            from src.core.config import DATA_DIR
+            
+            # Load entities
+            entities_file = DATA_DIR / "extracted" / "entities.json"
+            if entities_file.exists():
+                with open(entities_file, 'r') as f:
+                    self.entities_data = json.load(f)
+                    logger.info(f"Loaded {len(self.entities_data)} entities into memory")
+            else:
+                self.entities_data = []
+                logger.warning("No entities file found")
+            
+            # Load relationships
+            relationships_file = DATA_DIR / "extracted" / "relationships.json"
+            if relationships_file.exists():
+                with open(relationships_file, 'r') as f:
+                    self.relationships_data = json.load(f)
+                    logger.info(f"Loaded {len(self.relationships_data)} relationships into memory")
+            else:
+                self.relationships_data = []
+                logger.warning("No relationships file found")
+                
+        except Exception as e:
+            logger.error(f"Error loading entity/relationship data: {e}")
+            self.entities_data = []
+            self.relationships_data = []
     
     def process_query(self, query: str) -> Tuple[str, List[Dict[str, Any]]]:
         """
@@ -84,19 +122,16 @@ class QueryHandler:
             dict: Entity information
         """
         try:
-            import json
-            from src.core.config import DATA_DIR
+            # Ensure data is loaded
+            if self.entities_data is None:
+                self._load_processed_data()
             
-            # Load entities from file
-            entities_file = DATA_DIR / "extracted" / "entities.json"
-            if not entities_file.exists():
+            # Return error if still no data
+            if not self.entities_data:
                 return {"error": "No entity data available"}
             
-            with open(entities_file, 'r') as f:
-                entities = json.load(f)
-            
             # Find the entity by ID
-            for entity in entities:
+            for entity in self.entities_data:
                 if entity.get('entity_id') == entity_id:
                     return entity
             
@@ -117,23 +152,17 @@ class QueryHandler:
             list: Relationships involving the entity
         """
         try:
-            import json
-            from src.core.config import DATA_DIR
+            # Ensure data is loaded
+            if self.entities_data is None or self.relationships_data is None:
+                self._load_processed_data()
             
-            # Load entities and relationships from file
-            entities_file = DATA_DIR / "extracted" / "entities.json"
-            relationships_file = DATA_DIR / "extracted" / "relationships.json"
-            
-            if not entities_file.exists() or not relationships_file.exists():
+            # Return empty list if no data
+            if not self.entities_data or not self.relationships_data:
                 return []
-            
-            # Load entities to get the entity text
-            with open(entities_file, 'r') as f:
-                entities = json.load(f)
             
             # Find the entity by ID
             entity_text = None
-            for entity in entities:
+            for entity in self.entities_data:
                 if entity.get('entity_id') == entity_id:
                     entity_text = entity.get('text')
                     break
@@ -141,13 +170,9 @@ class QueryHandler:
             if not entity_text:
                 return []
             
-            # Load relationships
-            with open(relationships_file, 'r') as f:
-                relationships = json.load(f)
-            
             # Find relationships involving the entity
             entity_relationships = []
-            for rel in relationships:
+            for rel in self.relationships_data:
                 if rel.get('subject') == entity_text or rel.get('object') == entity_text:
                     entity_relationships.append(rel)
             

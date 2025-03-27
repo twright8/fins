@@ -1,9 +1,20 @@
-FROM nvidia/cuda:12.1.0-runtime-ubuntu22.04
+FROM pytorch/pytorch:2.4.0-cuda12.4-cudnn9-runtime
 
 # Set environment variables
 ENV PYTHONDONTWRITEBYTECODE=1
 ENV PYTHONUNBUFFERED=1
 ENV DEBIAN_FRONTEND=noninteractive
+
+# Set cache directories
+ENV HF_HOME=/root/.cache/huggingface
+ENV TRANSFORMERS_CACHE=/root/.cache/huggingface/transformers
+ENV SENTENCE_TRANSFORMERS_HOME=/root/.cache/torch/sentence_transformers
+ENV TORCH_HOME=/root/.cache/torch
+
+# Set other environment variables for better logging
+ENV TRANSFORMERS_VERBOSITY=info
+ENV HF_HUB_DISABLE_PROGRESS_BARS=0
+ENV TOKENIZERS_PARALLELISM=true
 
 # Set working directory
 WORKDIR /app
@@ -26,7 +37,9 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 # Install Python dependencies
 COPY requirements.txt .
 RUN pip3 install --no-cache-dir --upgrade pip && \
-    pip3 install --no-cache-dir -r requirements.txt
+    pip3 install --no-cache-dir -r requirements.txt &&\
+    pip install --no-cache-dir maverick-coref --no-deps
+
 
 # Copy app code
 COPY . .

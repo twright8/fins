@@ -47,16 +47,33 @@ DEFAULT_CONFIG = {
         "bm25_weight": 0.3,  # Weight for BM25 search in hybrid retrieval
     },
     
-    # LLM Generation (Aphrodite)
+    # LLM Generation
     "generation": {
+        # Common parameters
         "temperature": 0.3,  # Temperature for generation
         "max_tokens": 1024,  # Maximum tokens to generate
         "top_p": 0.9,  # Top-p sampling parameter
         "top_k": 50,  # Top-k sampling parameter
         "presence_penalty": 0.0,  # Presence penalty
-        "max_model_len": 8192,  # Maximum model context length
-        "gpu_memory_utilization": 0.85,  # GPU memory utilization
-        "quantization": "fp8",  # Quantization type
+        
+        # Provider selection - can be "aphrodite" or "deepseek"
+        "provider": "aphrodite",  # Default provider
+        
+        # Aphrodite (local) configuration
+        "aphrodite": {
+            "model": "Qwen/Qwen2.5-0.5B-Instruct",  # Model name
+            "max_model_len": 8192,  # Maximum model context length
+            "gpu_memory_utilization": 0.85,  # GPU memory utilization
+            "quantization": "fp8",  # Quantization type
+        },
+        
+        # DeepSeek API configuration
+        "deepseek": {
+            "api_key": "",  # DeepSeek API key (empty means not configured)
+            "api_base": "https://api.deepseek.com/v1",  # API base URL
+            "model": "deepseek-chat",  # DeepSeek model ID
+            "timeout": 60,  # Request timeout in seconds
+        },
     },
     
     # Qdrant Vector DB
@@ -71,6 +88,7 @@ DEFAULT_CONFIG = {
     "entity_extraction": {
         "confidence_threshold": 0.3,  # Minimum confidence for entity extraction
         "relationship_threshold": 0.3,  # Minimum confidence for relationship extraction
+        "fuzzy_match_threshold": 90,  # Fuzzy matching threshold (0-100) for entity deduplication
     },
     
     # UI

@@ -67,7 +67,7 @@ cd anti-corruption-rag
 docker-compose up -d
 ```
 
-This will start the Qdrant vector database and the main application.
+This will start the Qdrant vector database and the main application. The Docker container is configured to mount the necessary cache directories from your local system to enable persistent model caching across container restarts.
 
 3. Access the web interface at http://localhost:8501
 
@@ -92,6 +92,24 @@ docker run -d -p 6333:6333 -p 6334:6334 -v $(pwd)/data/qdrant_data:/qdrant/stora
 ```bash
 streamlit run src/ui/app.py
 ```
+
+### Model Caching
+
+The system uses several AI models that are automatically downloaded from Hugging Face:
+
+- NER model (Flair)
+- Coreference resolution model (Maverick)
+- Embedding model (E5)
+- Reranking model (MXBai)
+- LLM for generation (Qwen)
+
+On the first run, these models will be downloaded automatically to the standard cache locations:
+
+- `~/.cache/huggingface/hub` - Hugging Face models
+- `~/.cache/torch/hub` - PyTorch models
+- `~/.flair` - Flair-specific models (if used)
+
+Subsequent runs will use these cached models, significantly improving startup times. When running with Docker, the host cache directories are mounted into the container to ensure models are persisted between runs.
 
 ## Usage
 

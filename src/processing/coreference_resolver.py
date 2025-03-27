@@ -63,16 +63,52 @@ class CoreferenceResolver:
             return
         
         try:
+            import time
+            start_time = time.time()
+            
+            # This statement helps see when we start loading vs when the import happens
+            logger.info(f"Starting to load Maverick coreference model at time {start_time:.2f}")
+            print(f"[COREF] Starting to load Maverick coreference model...")
+            self._update_status("Preparing to load Maverick coreference model")
+            
+            # Log before import to help debug potential import issues
+            logger.info("Importing Maverick library...")
+            print(f"[COREF] Importing Maverick library")
+            
             from maverick import Maverick
             
-            self._update_status("Loading Maverick coreference model")
+            # Log after import success
+            import_time = time.time() - start_time
+            logger.info(f"Maverick imported successfully in {import_time:.2f}s")
+            print(f"[COREF] Maverick library imported in {import_time:.2f}s")
+            
+            # Update status with clear indication that we're initializing the model
+            self._update_status("Initializing Maverick coreference model (this may take some time)")
+            print(f"[COREF] Initializing Maverick model and loading weights...")
+            
+            # Log before actual model instantiation
+            model_start = time.time()
+            logger.info("Creating Maverick model instance...")
+            
+            # Actually create the model
             self.model = Maverick()
-            self._update_status("Maverick model loaded successfully")
+            
+            # Log success and timing
+            model_time = time.time() - model_start
+            total_time = time.time() - start_time
+            logger.info(f"Maverick model created in {model_time:.2f}s (total time: {total_time:.2f}s)")
+            print(f"[COREF] Maverick model loaded successfully in {total_time:.2f}s")
+            
+            self._update_status(f"Maverick model loaded successfully in {total_time:.2f}s")
             log_memory_usage(logger)
         except Exception as e:
             error_msg = f"Error loading Maverick model: {e}"
             self._update_status(error_msg)
             logger.error(error_msg)
+            import traceback
+            logger.error(traceback.format_exc())
+            print(f"[COREF ERROR] Failed to load Maverick model: {e}")
+            print(traceback.format_exc())
             raise
     
     def _unload_model(self):
@@ -105,18 +141,41 @@ class CoreferenceResolver:
         Returns:
             list: List of processed chunk dictionaries with coreference resolution
         """
+        import time
+        start_time = time.time()
+        
         self._update_status(f"Processing {len(chunks)} chunks for coreference resolution")
+        logger.info(f"Starting coreference resolution for {len(chunks)} chunks at {start_time:.2f}")
+        print(f"[COREF] Starting coreference resolution for {len(chunks)} chunks")
         
         try:
             # Load the model once at the beginning of processing
+            model_start = time.time()
+            logger.info("Loading Maverick model...")
+            print(f"[COREF] Loading Maverick model (may take some time)...")
             self._load_model()
+            model_time = time.time() - model_start
+            logger.info(f"Maverick model loaded in {model_time:.2f}s")
+            print(f"[COREF] Maverick model loaded in {model_time:.2f}s")
             
             # Create a copy of the chunks to avoid modifying the originals
             processed_chunks = []
             
+            # Performance tracking
+            total_text_len = sum(len(chunk.get('text', '')) for chunk in chunks)
+            total_tokens = 0
+            total_resolved_len = 0
+            resolution_times = []
+            
             # Process each chunk
             for i, chunk in enumerate(chunks):
+                chunk_start = time.time()
                 progress = ((i + 1) / len(chunks))
+                
+                if i % 10 == 0 or i == len(chunks) - 1:  # Log every 10 chunks or the last one
+                    logger.info(f"Processing chunk {i+1}/{len(chunks)}")
+                    print(f"[COREF] Processing chunk {i+1}/{len(chunks)}")
+                
                 self._update_status(f"Applying coreference resolution: chunk {i+1}/{len(chunks)}", progress)
                 
                 # Get the text content
@@ -126,8 +185,28 @@ class CoreferenceResolver:
                     processed_chunks.append(chunk)
                     continue
                 
+                # Track text length for analysis
+                text_len = len(text)
+                
                 # Apply coreference resolution
+                resolution_start = time.time()
                 resolved_text = self._apply_coreference_resolution(text)
+                resolution_time = time.time() - resolution_start
+                resolution_times.append(resolution_time)
+                
+                # Track resolved text length
+                resolved_len = len(resolved_text)
+                total_resolved_len += resolved_len
+                
+                # Estimate token count (rough approximation)
+                tokens = len(text.split())
+                total_tokens += tokens
+                
+                # Performance metrics for this chunk
+                chunk_time = time.time() - chunk_start
+                if i % 10 == 0 or chunk_time > 1.0:  # Log every 10th chunk or slow chunks
+                    logger.info(f"Chunk {i+1} processed in {chunk_time:.2f}s ({text_len} chars, {tokens} tokens)")
+                    print(f"[COREF] Chunk {i+1} processed in {chunk_time:.2f}s ({text_len} chars, ~{tokens} tokens)")
                 
                 # Create a new chunk with the resolved text
                 resolved_chunk = chunk.copy()
@@ -136,17 +215,39 @@ class CoreferenceResolver:
                 
                 processed_chunks.append(resolved_chunk)
             
+            # Log final statistics
+            total_time = time.time() - start_time
+            avg_resolution_time = sum(resolution_times) / len(resolution_times) if resolution_times else 0
+            
+            completion_msg = (
+                f"Coreference resolution complete for {len(chunks)} chunks in {total_time:.2f}s. "
+                f"Avg resolution time: {avg_resolution_time:.4f}s per chunk. "
+                f"Processed {total_text_len} chars, ~{total_tokens} tokens."
+            )
+            
+            logger.info(completion_msg)
+            print(f"[COREF] {completion_msg}")
             self._update_status(f"Coreference resolution complete for {len(chunks)} chunks")
+            
             return processed_chunks
             
         except Exception as e:
             error_msg = f"Error in coreference resolution: {e}"
             self._update_status(error_msg)
             logger.error(error_msg)
+            import traceback
+            logger.error(traceback.format_exc())
+            print(f"[COREF ERROR] {error_msg}")
+            print(traceback.format_exc())
             raise
         finally:
             # Ensure model is unloaded even if there's an error
+            unload_start = time.time()
+            logger.info("Unloading Maverick model...")
+            print(f"[COREF] Unloading Maverick model...")
             self._unload_model()
+            logger.info(f"Maverick model unloaded in {time.time() - unload_start:.2f}s")
+            print(f"[COREF] Maverick model unloaded in {time.time() - unload_start:.2f}s")
     
     def _apply_coreference_resolution(self, text: str) -> str:
         """

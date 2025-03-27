@@ -78,6 +78,9 @@ def process_documents(file_paths: List[str], status_queue: multiprocessing.Queue
         status_queue.put(('progress', 0.2, "Starting document chunking"))
         
         # Initialize document chunker
+        chunking_start_time = time.time()
+        logger.info(f"Initializing document chunker at {chunking_start_time:.2f}")
+        print(f"[PIPELINE] Initializing document chunker")
         chunker = DocumentChunker(status_queue=status_queue)
         
         # Process each document
@@ -85,8 +88,18 @@ def process_documents(file_paths: List[str], status_queue: multiprocessing.Queue
         for i, document in enumerate(documents):
             try:
                 # Chunk document
+                doc_start_time = time.time()
+                file_name = document.get('file_name', 'unknown')
+                logger.info(f"Chunking document {i+1}/{len(documents)}: {file_name}")
+                print(f"[PIPELINE] Chunking document {i+1}/{len(documents)}: {file_name}")
+                
                 chunks = chunker.chunk_document(document)
                 all_chunks.extend(chunks)
+                
+                # Log chunking time
+                doc_elapsed = time.time() - doc_start_time
+                logger.info(f"Document {file_name} chunked in {doc_elapsed:.2f}s, produced {len(chunks)} chunks")
+                print(f"[PIPELINE] Document {file_name} chunked in {doc_elapsed:.2f}s, produced {len(chunks)} chunks")
                 
                 # Update progress
                 progress = 0.2 + (i + 1) / len(documents) * 0.2  # 20-40% progress
@@ -99,13 +112,24 @@ def process_documents(file_paths: List[str], status_queue: multiprocessing.Queue
                 status_queue.put(('error', error_msg))
                 return False
         
-        logger.info(f"Created {len(all_chunks)} chunks from {len(documents)} documents")
+        # Log overall chunking stats
+        chunking_elapsed = time.time() - chunking_start_time
+        logger.info(f"Chunking complete in {chunking_elapsed:.2f}s. Created {len(all_chunks)} chunks from {len(documents)} documents")
+        print(f"[PIPELINE] Chunking complete in {chunking_elapsed:.2f}s. Created {len(all_chunks)} chunks from {len(documents)} documents")
         status_queue.put(('status', f"Created {len(all_chunks)} chunks"))
         log_memory_usage(logger)
+        
+        # Transition status
+        transition_start = time.time()
+        logger.info(f"Preparing for coreference resolution at {transition_start:.2f}")
+        print(f"[PIPELINE] Preparing for coreference resolution - initializing resolver")
+        status_queue.put(('status', "Transitioning to coreference resolution..."))
         
         # Step 3: Coreference Resolution
         status_queue.put(('status', "Step 3/5: Coreference Resolution"))
         status_queue.put(('progress', 0.4, "Starting coreference resolution"))
+        logger.info(f"Transition time before coreference resolution: {time.time() - transition_start:.2f}s")
+        print(f"[PIPELINE] Starting coreference resolution with {len(all_chunks)} chunks")
         
         # Initialize coreference resolver
         resolver = CoreferenceResolver(status_queue=status_queue)

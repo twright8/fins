@@ -93,17 +93,31 @@ class EntityExtractor:
             from flair.models import SequenceTagger
             from flair.nn import Classifier
             from flair.data import Sentence
+            import time
             
+            # NER model loading with detailed logging
+            logger.info(f"Starting to load Flair NER model: {self.ner_model_name}...")
             self._update_status(f"Loading NER model: {self.ner_model_name}")
-            self.tagger = SequenceTagger.load(self.ner_model_name)
             
+            start_time = time.time()
+            self.tagger = SequenceTagger.load(self.ner_model_name)
+            elapsed_time = time.time() - start_time
+            
+            logger.info(f"Flair NER model loaded successfully in {elapsed_time:.2f} seconds")
+            
+            # Relation extraction model loading
+            logger.info("Starting to load relation extraction model...")
             self._update_status("Loading relation extraction model")
+            
             # Use a general relation extraction model (adjust as needed)
-            # This is a placeholder - actual implementation depends on available models
+            start_time = time.time()
             try:
                 self.relation_extractor = Classifier.load('relations')
-            except:
-                logger.warning("Could not load relation model, relationships won't be extracted")
+                elapsed_time = time.time() - start_time
+                logger.info(f"Relation extraction model loaded successfully in {elapsed_time:.2f} seconds")
+            except Exception as rel_error:
+                logger.warning(f"Could not load relation model: {rel_error}")
+                logger.warning("Relationships won't be extracted. This is expected if no relation model is available.")
                 self.relation_extractor = None
             
             self._update_status("Models loaded successfully")
@@ -154,10 +168,10 @@ class EntityExtractor:
         """
         self._update_status(f"Processing {len(chunks)} chunks for entity extraction")
         
-        # Load models
-        self._load_models()
-        
         try:
+            # Load models once at the beginning of processing
+            self._load_models()
+            
             # Create results containers
             processed_chunks = []
             all_entities = []
@@ -217,20 +231,17 @@ class EntityExtractor:
             # Deduplicate relationships
             deduplicated_relationships = self._deduplicate_relationships(all_relationships)
             
-            # Unload models to free memory
-            self._unload_models()
-            
             self._update_status(f"Entity extraction complete. Found {len(deduplicated_entities)} entities and {len(deduplicated_relationships)} relationships")
             return processed_chunks, deduplicated_entities, deduplicated_relationships
             
         except Exception as e:
-            # Make sure to unload models even if there's an error
-            self._unload_models()
-            
             error_msg = f"Error in entity extraction: {e}"
             self._update_status(error_msg)
             logger.error(error_msg)
             raise
+        finally:
+            # Ensure models are unloaded even if there's an error
+            self._unload_models()
     
     def _process_text(self, text: str, document_id: str, chunk_id: str) -> Tuple[str, List[Dict[str, Any]], List[Dict[str, Any]]]:
         """
@@ -392,7 +403,68 @@ class EntityExtractor:
     
     def _deduplicate_entities(self, entities: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
         """
-        Deduplicate entities based on entity_id.
+        Deduplicate entities using fuzzy string matching.
+        
+        Args:
+            entities (list): List of extracted entities
+            
+        Returns:
+            list: Deduplicated entities
+        """
+        try:
+            from thefuzz import fuzz
+            
+            # Get fuzzy match threshold from config
+            match_threshold = CONFIG["entity_extraction"]["fuzzy_match_threshold"]
+            logger.info(f"Using fuzzy matching with threshold {match_threshold}")
+            
+            # Sort entities by confidence (highest first)
+            sorted_entities = sorted(entities, key=lambda e: e.get('confidence', 0), reverse=True)
+            
+            # List to hold deduplicated entities
+            deduplicated = []
+            
+            # Track processed entity texts by type
+            processed_texts = {}
+            
+            for entity in sorted_entities:
+                entity_text = entity.get('text', '').lower()
+                entity_type = entity.get('type', 'unknown')
+                
+                # Initialize entry for this entity type if it doesn't exist
+                if entity_type not in processed_texts:
+                    processed_texts[entity_type] = []
+                
+                # Check if this entity should be considered a duplicate
+                is_duplicate = False
+                
+                # Only compare with entities of the same type
+                for existing_text in processed_texts[entity_type]:
+                    # Calculate similarity ratio using token_sort_ratio
+                    # This handles word reordering, e.g., "John Smith" vs "Smith, John"
+                    similarity = fuzz.token_sort_ratio(entity_text, existing_text)
+                    
+                    if similarity >= match_threshold:
+                        is_duplicate = True
+                        logger.debug(f"Found duplicate: '{entity_text}' matches '{existing_text}' with score {similarity}")
+                        break
+                
+                if not is_duplicate:
+                    # If unique, add to results and track the text
+                    deduplicated.append(entity)
+                    processed_texts[entity_type].append(entity_text)
+                    logger.debug(f"Added unique entity: '{entity_text}' ({entity_type})")
+            
+            logger.info(f"Deduplicated entities from {len(entities)} to {len(deduplicated)} using fuzzy matching")
+            return deduplicated
+            
+        except ImportError:
+            logger.warning("thefuzz library not available. Falling back to exact ID matching.")
+            return self._fallback_deduplicate_entities(entities)
+    
+    def _fallback_deduplicate_entities(self, entities: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        """
+        Fallback method to deduplicate entities based on entity_id if fuzzy matching is unavailable.
         
         Args:
             entities (list): List of extracted entities
@@ -404,15 +476,14 @@ class EntityExtractor:
         unique_entities = {}
         
         for entity in entities:
-            entity_id = entity['entity_id']
+            entity_id = entity.get('entity_id')
             
-            if entity_id not in unique_entities:
+            if entity_id and entity_id not in unique_entities:
                 # This is a new entity
                 unique_entities[entity_id] = entity
-            else:
+            elif entity_id and entity['confidence'] > unique_entities[entity_id]['confidence']:
                 # Update existing entity if this one has higher confidence
-                if entity['confidence'] > unique_entities[entity_id]['confidence']:
-                    unique_entities[entity_id] = entity
+                unique_entities[entity_id] = entity
         
         return list(unique_entities.values())
     

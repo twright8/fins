@@ -7,8 +7,10 @@ from pathlib import Path
 import pickle
 import torch
 import numpy as np
+import gc
 from typing import List, Dict, Any, Union, Optional
 import time
+import traceback
 
 # Add parent directory to sys.path to enable imports from project root
 sys.path.append(str(Path(__file__).resolve().parent.parent.parent))
@@ -56,6 +58,9 @@ class Retriever:
         
         # Load BM25 index
         self._load_bm25_index()
+        
+        # Load embedding models at initialization
+        self._load_embedding_model()
     
     def _load_bm25_index(self) -> bool:
         """
@@ -90,18 +95,42 @@ class Retriever:
         
         try:
             from embed import BatchedInference
+            import time
+            import os
             
-            logger.info(f"Loading embedding models via Infinity: {self.embedding_model_name}, {self.reranking_model_name}")
+            # Log cache location for debugging
+            hf_cache = os.environ.get('HF_HOME', os.path.expanduser('~/.cache/huggingface'))
+            logger.info(f"Using Hugging Face cache directory: {hf_cache}")
+            
+            # Determine device
+            device = "cuda" if torch.cuda.is_available() else "cpu"
+            
+            logger.info(f"Starting to load embedding and reranking models via Infinity:")
+            logger.info(f"- Embedding model: {self.embedding_model_name}")
+            logger.info(f"- Reranking model: {self.reranking_model_name}")
+            logger.info(f"- Device: {device}")
+            
+            # Time the model loading
+            start_time = time.time()
+            
             self.embed_register = BatchedInference(
                 model_id=[
                     self.embedding_model_name,
                     self.reranking_model_name
                 ],
                 engine="torch",
-                device="cuda" if torch.cuda.is_available() else "cpu"
+                device=device
             )
             
-            logger.info("Embedding models loaded successfully")
+            elapsed_time = time.time() - start_time
+            logger.info(f"Embedding and reranking models loaded successfully in {elapsed_time:.2f} seconds")
+            
+            # Log memory usage after loading
+            import gc
+            if torch.cuda.is_available():
+                mem_allocated = torch.cuda.memory_allocated() / (1024**3)  # Convert to GB
+                mem_reserved = torch.cuda.memory_reserved() / (1024**3)    # Convert to GB
+                logger.info(f"GPU memory after model loading: {mem_allocated:.2f}GB allocated, {mem_reserved:.2f}GB reserved")
             
         except Exception as e:
             logger.error(f"Error loading embedding model: {e}")
@@ -131,6 +160,112 @@ class Retriever:
             
             log_memory_usage(logger)
     
+    def get_chunks(self, limit: int = 20, search_text: str = None, document_filter: str = None) -> List[Dict[str, Any]]:
+        """
+        Get chunks from the vector database for exploration.
+        
+        Args:
+            limit (int): Maximum number of chunks to retrieve
+            search_text (str, optional): Text to search for within chunks
+            document_filter (str, optional): Filter by document name
+            
+        Returns:
+            list: List of chunks with their metadata
+        """
+        try:
+            from qdrant_client import QdrantClient
+            
+            # Connect to Qdrant
+            client = QdrantClient(host=self.qdrant_host, port=self.qdrant_port)
+            
+            # Build filter if needed
+            filter_conditions = []
+            
+            if search_text:
+                filter_conditions.append({
+                    "must": [{
+                        "key": "text",
+                        "match": {"text": search_text}
+                    }]
+                })
+            
+            if document_filter:
+                filter_conditions.append({
+                    "must": [{
+                        "key": "file_name",
+                        "match": {"text": document_filter}
+                    }]
+                })
+            
+            # Combine filters
+            filter_obj = {"must": filter_conditions} if filter_conditions else None
+            
+            # Get chunks
+            scroll_result = client.scroll(
+                collection_name=self.qdrant_collection,
+                limit=limit,
+                with_payload=True,
+                with_vectors=False,
+                filter=filter_obj
+            )
+            
+            # Format results
+            chunks = []
+            for point in scroll_result[0]:
+                chunks.append({
+                    'id': point.id,
+                    'text': point.payload.get('text', ''),
+                    'metadata': {k: v for k, v in point.payload.items() if k != 'text'}
+                })
+            
+            return chunks
+            
+        except Exception as e:
+            logger.error(f"Error retrieving chunks: {e}")
+            return []
+            
+    def get_collection_info(self) -> Dict[str, Any]:
+        """
+        Get information about the vector collection.
+        
+        Returns:
+            dict: Collection information including point count
+        """
+        try:
+            from qdrant_client import QdrantClient
+            
+            # Connect to Qdrant
+            client = QdrantClient(host=self.qdrant_host, port=self.qdrant_port)
+            
+            # Check if collection exists
+            collections = client.get_collections().collections
+            collection_names = [c.name for c in collections]
+            
+            if self.qdrant_collection in collection_names:
+                # Get collection info
+                collection_info = client.get_collection(self.qdrant_collection)
+                
+                return {
+                    'exists': True,
+                    'name': self.qdrant_collection,
+                    'points_count': collection_info.points_count,
+                    'vector_size': collection_info.config.params.vectors.size,
+                    'distance': str(collection_info.config.params.vectors.distance)
+                }
+            else:
+                return {'exists': False}
+            
+        except Exception as e:
+            logger.error(f"Error getting collection info: {e}")
+            return {'exists': False, 'error': str(e)}
+    
+    def shutdown(self):
+        """
+        Shutdown the retriever and free resources.
+        """
+        logger.info("Shutting down retriever")
+        self._unload_embedding_model()
+    
     def retrieve(self, query: str, use_reranking: bool = True) -> List[Dict[str, Any]]:
         """
         Retrieve relevant chunks using hybrid search (BM25 + vector).
@@ -156,8 +291,9 @@ class Retriever:
                 if not success:
                     logger.warning("BM25 index not available, using vector search only")
             
-            # Load embedding model
-            self._load_embedding_model()
+            # Ensure embedding model is loaded
+            if self.embed_register is None:
+                self._load_embedding_model()
             
             # Get BM25 results
             bm25_results = self._bm25_search(query) if self.bm25_index is not None else []
@@ -175,9 +311,6 @@ class Retriever:
             else:
                 final_results = fused_results
             
-            # Unload embedding model
-            self._unload_embedding_model()
-            
             # Log timing
             elapsed_time = time.time() - start_time
             logger.info(f"Retrieval completed in {elapsed_time:.2f}s. Found {len(final_results)} results.")
@@ -186,10 +319,6 @@ class Retriever:
             
         except Exception as e:
             logger.error(f"Error in retrieval: {e}")
-            
-            # Make sure to unload model even if there's an error
-            self._unload_embedding_model()
-            
             # Return empty list on error
             return []
     
@@ -205,6 +334,8 @@ class Retriever:
         """
         import nltk
         from nltk.tokenize import word_tokenize
+        import pickle
+        import os
         
         try:
             # Ensure NLTK tokenizer is available
@@ -213,11 +344,37 @@ class Retriever:
             except LookupError:
                 nltk.download('punkt')
             
-            # Tokenize the query
+            # Load stopwords if available, otherwise use empty set
+            stop_words = set()
+            stop_words_file = self.bm25_dir / "stopwords.pkl"
+            if os.path.exists(stop_words_file):
+                try:
+                    with open(stop_words_file, 'rb') as f:
+                        stop_words = pickle.load(f)
+                except Exception as e:
+                    logger.warning(f"Error loading stopwords: {e}. Proceeding without stopwords.")
+            else:
+                # Try loading from NLTK if available
+                try:
+                    from nltk.corpus import stopwords
+                    nltk.data.find('corpora/stopwords')
+                    stop_words = set(stopwords.words('english'))
+                except Exception:
+                    logger.warning("Stopwords not available. Proceeding without stopwords.")
+            
+            # Tokenize and filter the query
             tokenized_query = word_tokenize(query.lower())
             
+            # Apply stopword filtering consistently with how the index was built
+            filtered_query = [token for token in tokenized_query if token not in stop_words]
+            
+            # If all tokens were stopwords, use the original tokens to avoid empty query
+            if not filtered_query and tokenized_query:
+                logger.warning("All query tokens were stopwords. Using original query.")
+                filtered_query = tokenized_query
+            
             # Get BM25 scores
-            bm25_scores = self.bm25_index.get_scores(tokenized_query)
+            bm25_scores = self.bm25_index.get_scores(filtered_query)
             
             # Create results array with document ids and scores
             results = []
@@ -292,14 +449,14 @@ class Retriever:
     
     def _fuse_results(self, bm25_results: List[Dict[str, Any]], vector_results: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
         """
-        Fuse results from BM25 and vector search using reciprocal rank fusion.
+        Fuse results from BM25 and vector search using Reciprocal Rank Fusion (RRF).
         
         Args:
             bm25_results (list): BM25 search results
             vector_results (list): Vector search results
             
         Returns:
-            list: Fused search results
+            list: Fused search results using RRF
         """
         # If either result set is empty, return the other
         if not bm25_results:
@@ -307,63 +464,65 @@ class Retriever:
         if not vector_results:
             return bm25_results[:self.top_k_hybrid]
         
-        # Create a dictionary to store combined scores by document ID
-        # Using chunk_id as the key
-        combined_docs = {}
+        # RRF constant k (prevents division by zero and controls the impact of high ranks)
+        k = 60
         
-        # Normalize BM25 scores (max normalization)
-        max_bm25_score = max([r['score'] for r in bm25_results]) if bm25_results else 1.0
-        for i, result in enumerate(bm25_results):
-            doc_id = result['metadata'].get('chunk_id', f"bm25_{i}")
-            normalized_score = result['score'] / max_bm25_score if max_bm25_score > 0 else 0
-            
-            combined_docs[doc_id] = {
-                'bm25_score': normalized_score,
-                'vector_score': 0.0,
+        # Create dictionaries for ranking lookup
+        bm25_dict = {}
+        vector_dict = {}
+        
+        # Assign ranks to BM25 results (sorted by score in descending order)
+        for rank, result in enumerate(sorted(bm25_results, key=lambda x: x['score'], reverse=True)):
+            doc_id = result['metadata'].get('chunk_id', result.get('id', f"bm25_{rank}"))
+            bm25_dict[doc_id] = {
+                'rank': rank + 1,  # 1-based ranking
+                'score': result['score'],
                 'text': result['text'],
                 'metadata': result['metadata']
             }
         
-        # Normalize vector scores (usually already normalized to cosine similarity)
-        for i, result in enumerate(vector_results):
-            doc_id = result['metadata'].get('chunk_id', result['id'])
-            
-            if doc_id in combined_docs:
-                # Document exists in BM25 results, update vector score
-                combined_docs[doc_id]['vector_score'] = result['score']
-            else:
-                # New document from vector search
-                combined_docs[doc_id] = {
-                    'bm25_score': 0.0,
-                    'vector_score': result['score'],
-                    'text': result['text'],
-                    'metadata': result['metadata']
-                }
+        # Assign ranks to vector search results
+        for rank, result in enumerate(sorted(vector_results, key=lambda x: x['score'], reverse=True)):
+            doc_id = result['metadata'].get('chunk_id', result.get('id', f"vector_{rank}"))
+            vector_dict[doc_id] = {
+                'rank': rank + 1,  # 1-based ranking
+                'score': result['score'],
+                'text': result['text'],
+                'metadata': result['metadata']
+            }
         
-        # Combine scores with weights
-        results = []
-        for doc_id, doc in combined_docs.items():
-            combined_score = (
-                self.bm25_weight * doc['bm25_score'] +
-                self.vector_weight * doc['vector_score']
-            )
+        # Combine all unique document IDs
+        all_doc_ids = set(bm25_dict.keys()) | set(vector_dict.keys())
+        
+        # Calculate RRF scores
+        rrf_results = []
+        for doc_id in all_doc_ids:
+            # Get ranks (defaulting to a large number if not in a result set)
+            bm25_rank = bm25_dict.get(doc_id, {'rank': len(bm25_results) + 100})['rank']
+            vector_rank = vector_dict.get(doc_id, {'rank': len(vector_results) + 100})['rank']
             
-            results.append({
+            # Calculate RRF score
+            rrf_score = (1 / (k + bm25_rank)) + (1 / (k + vector_rank))
+            
+            # Get document info from whichever source has it
+            doc_info = bm25_dict.get(doc_id) or vector_dict.get(doc_id)
+            
+            rrf_results.append({
                 'id': doc_id,
-                'score': combined_score,
-                'bm25_score': doc['bm25_score'],
-                'vector_score': doc['vector_score'],
-                'text': doc['text'],
-                'metadata': doc['metadata']
+                'score': rrf_score,
+                'bm25_rank': bm25_rank,
+                'vector_rank': vector_rank,
+                'text': doc_info['text'],
+                'metadata': doc_info['metadata']
             })
         
-        # Sort by combined score (descending)
-        results.sort(key=lambda x: x['score'], reverse=True)
+        # Sort by RRF score (descending)
+        rrf_results.sort(key=lambda x: x['score'], reverse=True)
         
         # Limit to top_k
-        results = results[:self.top_k_hybrid]
+        results = rrf_results[:self.top_k_hybrid]
         
-        logger.info(f"Fusion returned {len(results)} results")
+        logger.info(f"RRF fusion returned {len(results)} results")
         return results
     
     def _rerank(self, query: str, results: List[Dict[str, Any]]) -> List[Dict[str, Any]]:

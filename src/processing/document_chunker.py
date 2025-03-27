@@ -74,14 +74,97 @@ class DocumentChunker:
         
         try:
             from langchain_huggingface import HuggingFaceEmbeddings
+            import time
+            import os
+            import torch
+            from transformers import logging as transformers_logging
+            
+            # Set transformers logging to more verbose level
+            transformers_logging.set_verbosity_info()
+            
+            # Ensure the TRANSFORMERS_CACHE env var is set and logged
+            hf_cache = os.environ.get('HF_HOME', os.path.expanduser('~/.cache/huggingface'))
+            transformers_cache = os.environ.get('TRANSFORMERS_CACHE', os.path.join(hf_cache, 'transformers'))
+            
+            # Print caching info directly to console for visibility
+            print(f"\n[LOADING] Loading semantic chunking embedding model: {self.embedding_model_name}")
+            print(f"[CACHE] Using Hugging Face cache directory: {hf_cache}")
+            print(f"[CACHE] Using Transformers cache directory: {transformers_cache}")
+            
+            # Log cache location in application logs
+            logger.info(f"Starting to load embedding model for chunking: {self.embedding_model_name}...")
+            logger.info(f"Using Hugging Face cache directory: {hf_cache}")
+            logger.info(f"Using Transformers cache directory: {transformers_cache}")
             
             self._update_status(f"Loading embedding model: {self.embedding_model_name}")
-            self.embedding_model = HuggingFaceEmbeddings(model_name=self.embedding_model_name)
+            
+            # Configure PyTorch to use GPU if available
+            if torch.cuda.is_available():
+                print(f"[INFO] CUDA is available - using device: {torch.cuda.get_device_name(0)}")
+                print(f"[INFO] CUDA memory: {torch.cuda.get_device_properties(0).total_memory / 1e9:.2f} GB total")
+                # Set PyTorch to use CUDA
+                os.environ["CUDA_VISIBLE_DEVICES"] = "0"  # Use first GPU
+                device = torch.device("cuda")
+            else:
+                print(f"[INFO] CUDA is not available - using CPU")
+                device = torch.device("cpu")
+                
+            # Configure HuggingFaceEmbeddings with explicit cache location and parameters
+            start_time = time.time()
+            
+            # Determine device
+            device = "cuda" if torch.cuda.is_available() else "cpu"
+            
+            # Try to create the model with different parameter sets
+            # (to handle different versions of langchain_huggingface)
+            try:
+                # First try with the more detailed configuration
+                self.embedding_model = HuggingFaceEmbeddings(
+                    model_name=self.embedding_model_name,
+                    cache_folder=transformers_cache,
+                    model_kwargs={
+                        "device": device,
+                        "use_auth_token": False,  # Set to True if using private models
+                    },
+                    encode_kwargs={"normalize_embeddings": True},
+                )
+                print(f"[INFO] Created embedding model with detailed configuration")
+            except TypeError as te:
+                # Fall back to simpler configuration if the above fails
+                print(f"[WARNING] Detailed configuration failed ({str(te)}), falling back to basic configuration")
+                self.embedding_model = HuggingFaceEmbeddings(
+                    model_name=self.embedding_model_name,
+                )
+                print(f"[INFO] Created embedding model with basic configuration")
+            
+            elapsed_time = time.time() - start_time
+            
+            # Log successful loading with timing information
+            logger.info(f"Embedding model {self.embedding_model_name} loaded successfully in {elapsed_time:.2f} seconds")
+            print(f"[SUCCESS] Embedding model loaded successfully in {elapsed_time:.2f} seconds")
+            
+            # Log model device information (safely check for attributes)
+            try:
+                # Try different attribute names that might exist
+                if hasattr(self.embedding_model, 'client'):
+                    device = getattr(self.embedding_model.client, 'device', 'unknown')
+                elif hasattr(self.embedding_model, '_client'):
+                    device = getattr(self.embedding_model._client, 'device', 'unknown')
+                else:
+                    device = "unknown (client attribute not found)"
+                print(f"[INFO] Model loaded on device: {device}")
+            except Exception as device_error:
+                print(f"[INFO] Model loaded (device info unavailable: {device_error})")
+            
             self._update_status(f"Embedding model loaded successfully")
+            
         except Exception as e:
             error_msg = f"Error loading embedding model: {e}"
             self._update_status(error_msg)
             logger.error(error_msg)
+            print(f"[ERROR] Failed to load embedding model: {e}")
+            import traceback
+            traceback.print_exc()
             raise
     
     def _unload_embedding_model(self):
@@ -114,32 +197,70 @@ class DocumentChunker:
         Returns:
             list: List of chunk dictionaries
         """
+        import time
+        start_time = time.time()
+        
         doc_id = document.get('document_id', 'unknown')
+        doc_name = document.get('file_name', 'unknown')
+        doc_type = document.get('file_type', 'unknown')
+        
+        logger.info(f"Starting chunking for document: {doc_name} (ID: {doc_id}, Type: {doc_type})")
+        print(f"[CHUNKER] Starting chunking for document: {doc_name} (ID: {doc_id}, Type: {doc_type})")
         self._update_status(f"Chunking document: {doc_id}")
         
         chunks = []
         
-        # First, load the embedding model for semantic chunking
-        self._load_embedding_model()
-        
         try:
+            # Log model loading start
+            model_start = time.time()
+            logger.info("Loading embedding model for chunking...")
+            print(f"[CHUNKER] Loading embedding model...")
+            
+            # Load the embedding model once at the beginning
+            self._load_embedding_model()
+            
+            # Log model loading completion
+            model_time = time.time() - model_start
+            logger.info(f"Embedding model loaded in {model_time:.2f}s")
+            print(f"[CHUNKER] Embedding model loaded in {model_time:.2f}s")
+            
             # Process each content item (page or section)
             content_items = document.get('content', [])
+            total_text_size = sum(len(item.get('text', '')) for item in content_items)
+            
+            logger.info(f"Document has {len(content_items)} content items, total size: {total_text_size} characters")
+            print(f"[CHUNKER] Document has {len(content_items)} items with {total_text_size} characters total")
+            
+            total_chunks_created = 0
+            
             for i, content_item in enumerate(content_items):
+                item_start = time.time()
                 progress = ((i + 1) / len(content_items)) * 0.9  # Progress up to 90%
                 
                 page_num = content_item.get('page_num', None)
                 text = content_item.get('text', '')
+                text_size = len(text)
                 
                 # Skip empty content
                 if not text.strip():
+                    logger.info(f"Skipping empty content item {i+1}/{len(content_items)}")
                     continue
                 
-                # Generate semantic chunks for this content
-                self._update_status(f"Chunking content item {i+1}/{len(content_items)}" + 
-                                  (f" (page {page_num})" if page_num else ""), progress)
+                # Log item details
+                page_info = f" (page {page_num})" if page_num else ""
+                logger.info(f"Processing content item {i+1}/{len(content_items)}{page_info}, size: {text_size} chars")
+                print(f"[CHUNKER] Processing item {i+1}/{len(content_items)}{page_info}, size: {text_size} chars")
                 
+                # Generate semantic chunks for this content
+                self._update_status(f"Chunking content item {i+1}/{len(content_items)}{page_info}", progress)
+                
+                chunking_start = time.time()
                 content_chunks = self._semantic_chunking(text)
+                chunking_time = time.time() - chunking_start
+                
+                # Log chunking details
+                logger.info(f"Item {i+1} chunked into {len(content_chunks)} chunks in {chunking_time:.2f}s")
+                print(f"[CHUNKER] Item {i+1} chunked into {len(content_chunks)} chunks in {chunking_time:.2f}s")
                 
                 # Create chunk objects with metadata
                 for chunk_idx, chunk_text in enumerate(content_chunks):
@@ -160,23 +281,53 @@ class DocumentChunker:
                     }
                     
                     chunks.append(chunk)
+                
+                total_chunks_created += len(content_chunks)
+                
+                # Log item complete time
+                item_time = time.time() - item_start
+                if item_time > 1.0:
+                    logger.info(f"Content item {i+1} processed in {item_time:.2f}s")
+                    print(f"[CHUNKER] Content item {i+1} processed in {item_time:.2f}s")
             
-            # Cleanup
-            self._unload_embedding_model()
+            # End of chunking
+            total_time = time.time() - start_time
+            avg_chunk_size = sum(len(chunk.get('text', '')) for chunk in chunks) / len(chunks) if chunks else 0
             
+            result_msg = (
+                f"Created {len(chunks)} chunks for document {doc_name} in {total_time:.2f}s. "
+                f"Average chunk size: {avg_chunk_size:.1f} characters"
+            )
+            
+            logger.info(result_msg)
+            print(f"[CHUNKER] {result_msg}")
             self._update_status(f"Created {len(chunks)} chunks for document {doc_id}", 1.0)
             log_memory_usage(logger)
             
             return chunks
             
         except Exception as e:
-            # Make sure to unload model even if there's an error
-            self._unload_embedding_model()
-            
             error_msg = f"Error chunking document {doc_id}: {e}"
             self._update_status(error_msg)
             logger.error(error_msg)
+            import traceback
+            logger.error(traceback.format_exc())
+            print(f"[CHUNKER ERROR] {error_msg}")
+            print(traceback.format_exc())
             raise
+        finally:
+            # Log unloading start
+            unload_start = time.time()
+            logger.info("Unloading embedding model...")
+            print(f"[CHUNKER] Unloading embedding model...")
+            
+            # Ensure model is unloaded even if there's an error
+            self._unload_embedding_model()
+            
+            # Log unloading completion
+            unload_time = time.time() - unload_start
+            logger.info(f"Embedding model unloaded in {unload_time:.2f}s")
+            print(f"[CHUNKER] Embedding model unloaded in {unload_time:.2f}s")
     
     def _semantic_chunking(self, text: str) -> List[str]:
         """
@@ -194,44 +345,90 @@ class DocumentChunker:
         try:
             # Step 1: First split by natural boundaries
             initial_chunks = self._split_by_recursive_boundaries(text)
-            logger.info(f"Initial boundary splitting created {len(initial_chunks)} chunks")
+            chunk_count = len(initial_chunks)
+            logger.info(f"Initial boundary splitting created {chunk_count} chunks")
+            print(f"[CHUNKING] Initial boundary splitting created {chunk_count} chunks")
             
             # Step 2: Apply semantic chunking to each large chunk
             from langchain_experimental.text_splitter import SemanticChunker
             
+            # Ensure CUDA is set properly for PyTorch if available (fallback in case model setup didn't do it)
+            if torch.cuda.is_available():
+                print(f"[INFO] CUDA is available - forcing embedded models to use GPU")
+                # Try to ensure any future tensor operations use CUDA
+                import os
+                os.environ["CUDA_VISIBLE_DEVICES"] = "0"  # Use first GPU
+                torch.set_default_tensor_type('torch.cuda.FloatTensor')
+            
             semantic_chunks = []
-            for chunk in initial_chunks:
+            large_chunk_count = sum(1 for chunk in initial_chunks if len(chunk) > self.chunk_size)
+            print(f"[CHUNKING] Found {large_chunk_count} large chunks for semantic splitting")
+            
+            if large_chunk_count > 0:
+                print(f"[CHUNKING] Applying semantic chunking to {large_chunk_count} large chunks")
+            
+            for i, chunk in enumerate(initial_chunks):
                 # Only apply semantic chunking to larger chunks
                 if len(chunk) > self.chunk_size:
-                    # Configure semantic chunker
-                    text_splitter = SemanticChunker(
-                        self.embedding_model,
-                        breakpoint_threshold_type="percentile",
-                        breakpoint_threshold_amount=95.0
-                    )
-                    
-                    # Apply semantic chunking
-                    docs = text_splitter.create_documents([chunk])
-                    semantic_chunks.extend([doc.page_content for doc in docs])
+                    try:
+                        # Update on progress
+                        if large_chunk_count > 1:
+                            print(f"[CHUNKING] Processing large chunk {i+1}/{large_chunk_count} with semantic chunker")
+                            
+                        # Configure semantic chunker
+                        text_splitter = SemanticChunker(
+                            self.embedding_model,
+                            breakpoint_threshold_type="percentile",
+                            breakpoint_threshold_amount=95.0
+                        )
+                        
+                        # Apply semantic chunking
+                        docs = text_splitter.create_documents([chunk])
+                        results = [doc.page_content for doc in docs]
+                        
+                        print(f"[CHUNKING] Semantic chunker split text of {len(chunk)} chars into {len(results)} chunks")
+                        semantic_chunks.extend(results)
+                    except Exception as chunk_error:
+                        # Handle errors in individual chunk processing
+                        logger.warning(f"Error in semantic chunking for chunk {i}: {chunk_error}")
+                        print(f"[WARNING] Error in semantic chunking for chunk {i}: {chunk_error}")
+                        print(f"[WARNING] Falling back to sentence splitting for this chunk")
+                        
+                        # Fall back to sentence splitting for this chunk
+                        semantic_chunks.extend(self._sentence_splitting(chunk))
                 else:
                     # Keep small chunks as-is
                     semantic_chunks.append(chunk)
             
             # Step 3: Apply fallback splitting for any chunks still too large
             final_chunks = []
+            oversized_chunks = sum(1 for chunk in semantic_chunks if len(chunk) > self.chunk_size * 1.5)
+            
+            if oversized_chunks > 0:
+                print(f"[CHUNKING] {oversized_chunks} chunks are still oversized, applying sentence splitting")
+                
             for chunk in semantic_chunks:
                 if len(chunk) > self.chunk_size * 1.5:  # Allow some flexibility
                     # Split oversized chunks using sentence boundaries
-                    final_chunks.extend(self._sentence_splitting(chunk))
+                    sentence_chunks = self._sentence_splitting(chunk)
+                    final_chunks.extend(sentence_chunks)
+                    print(f"[CHUNKING] Split chunk of {len(chunk)} chars into {len(sentence_chunks)} sentence chunks")
                 else:
                     final_chunks.append(chunk)
             
+            # Log results
             logger.info(f"Semantic chunking pipeline created {len(final_chunks)} chunks from text of length {len(text)}")
+            print(f"[CHUNKING] Final result: {len(final_chunks)} chunks from text of length {len(text)}")
+            
             return final_chunks
             
         except Exception as e:
             logger.error(f"Error during semantic chunking: {e}")
             logger.warning("Falling back to basic chunking")
+            print(f"[ERROR] Semantic chunking failed: {e}")
+            print(f"[WARNING] Falling back to basic chunking")
+            import traceback
+            traceback.print_exc()
             return self._basic_chunking(text)
     
     def _split_by_recursive_boundaries(self, text: str) -> List[str]:

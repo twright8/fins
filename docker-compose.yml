@@ -29,6 +29,8 @@ services:
     volumes:
       - .:/app
       - ~/.cache/huggingface:/root/.cache/huggingface  # HuggingFace cache
+      - ~/.cache/torch:/root/.cache/torch              # PyTorch cache
+      - ~/.flair:/root/.flair                          # Flair cache (if used)
     depends_on:
       - qdrant
     environment:
@@ -36,6 +38,9 @@ services:
       - QDRANT_PORT=6333
       - STREAMLIT_SERVER_PORT=8501
       - STREAMLIT_SERVER_ADDRESS=0.0.0.0
+      - HF_HUB_DISABLE_PROGRESS_BARS=0  # Ensure progress bars are enabled
+      - PYTHONUNBUFFERED=1              # Ensure Python outputs are not buffered
+      - TRANSFORMERS_VERBOSITY=info     # Set transformers verbosity
     runtime: nvidia
     deploy:
       resources:

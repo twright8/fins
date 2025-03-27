@@ -5,11 +5,21 @@ import os
 import sys
 import time
 import json
+import logging
 from pathlib import Path
 from typing import List, Dict, Any, Optional
 
 import streamlit as st
 import json
+
+# Configure basic logging to ensure output goes to console
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
+    handlers=[
+        logging.StreamHandler(sys.stdout)
+    ]
+)
 
 # Add parent directory to sys.path to enable imports from project root
 sys.path.append(str(Path(__file__).resolve().parent.parent.parent))
@@ -28,7 +38,22 @@ from src.ui.components import (
 from src.utils.logger import setup_logger
 from src.utils.file_utils import save_uploaded_files, clear_temp_files
 
+# Enable more verbose logging for libraries
+logging.getLogger('transformers').setLevel(logging.INFO)
+logging.getLogger('flair').setLevel(logging.INFO)
+logging.getLogger('embed').setLevel(logging.INFO)
+logging.getLogger('qdrant_client').setLevel(logging.INFO)
+
+# Setup our own logger
 logger = setup_logger(__name__)
+
+# Print startup message for better CLI visibility
+print("\n" + "=" * 80)
+print(" Anti-Corruption RAG System - Starting Up ".center(80, "="))
+print("=" * 80)
+print("Command-line output enabled for better visibility of background operations")
+print(f"Model cache location: {os.path.expanduser('~/.cache/huggingface')}")
+print("=" * 80 + "\n")
 
 # Page configuration
 st.set_page_config(
@@ -83,23 +108,16 @@ st.markdown(f"""
 
 def load_processed_data():
     """
-    Load processed data from files.
+    Load processed entity and relationship data from files.
     
     Returns:
-        tuple: (documents, entities, relationships)
+        tuple: (entities, relationships)
     """
     # Initialize empty data
-    documents = []
     entities = []
     relationships = []
     
     try:
-        # Documents - no central storage yet, placeholder
-        documents_file = DATA_DIR / "processed_documents.json"
-        if documents_file.exists():
-            with open(documents_file, 'r') as f:
-                documents = json.load(f)
-        
         # Entities
         entities_file = DATA_DIR / "extracted" / "entities.json"
         if entities_file.exists():
@@ -116,7 +134,7 @@ def load_processed_data():
         logger.error(f"Error loading processed data: {e}")
         st.error(f"Error loading processed data: {str(e)}")
     
-    return documents, entities, relationships
+    return entities, relationships
 
 def initialize_data_directories():
     """
@@ -250,6 +268,37 @@ def main():
             
             # Generation settings
             st.markdown("#### Generation Settings")
+            
+            # LLM Provider selection
+            provider_options = ["aphrodite", "deepseek"]
+            current_provider = CONFIG["generation"]["provider"]
+            
+            # Check if DeepSeek API key is configured
+            deepseek_api_key = CONFIG["generation"]["deepseek"]["api_key"]
+            deepseek_available = bool(deepseek_api_key.strip())
+            
+            if not deepseek_available and current_provider == "deepseek":
+                st.warning("DeepSeek selected but API key not configured. Will use Aphrodite instead.")
+            
+            # Create a selectbox for provider selection
+            new_provider = st.selectbox(
+                "LLM Provider",
+                options=provider_options,
+                index=provider_options.index(current_provider) if current_provider in provider_options else 0,
+                help="Select the LLM provider to use for text generation"
+            )
+            
+            # If provider has changed, update config
+            if new_provider != current_provider:
+                # Only allow switching to DeepSeek if API key is configured
+                if new_provider == "deepseek" and not deepseek_available:
+                    st.error("Cannot switch to DeepSeek - API key not configured in config.yaml")
+                else:
+                    # Update CONFIG in memory (this won't persist to disk)
+                    CONFIG["generation"]["provider"] = new_provider
+                    st.success(f"Switched to {new_provider} provider. Restart the app for changes to take effect.")
+            
+            # Generation parameters
             st.slider(
                 "Temperature",
                 min_value=0.0,
@@ -270,12 +319,14 @@ def main():
     
     # Main content
     if st.session_state.processing:
-        # Display processing status
+        # Display processing status with spinner for visual feedback
         st.markdown("## Document Processing")
-        processing_success = processing_status(
-            st.session_state.status_queue,
-            st.session_state.process
-        )
+        
+        with st.spinner("Processing documents... This may take several minutes depending on document size and complexity."):
+            processing_success = processing_status(
+                st.session_state.status_queue,
+                st.session_state.process
+            )
         
         # Check if processing is complete
         if not st.session_state.process.is_alive():
@@ -287,6 +338,9 @@ def main():
                 del st.session_state.temp_file_paths
             
             if processing_success:
+                # Show success message
+                st.success("Document processing completed successfully! You can now explore the documents and extracted entities or query the system.")
+                
                 # Switch to explore view on success
                 st.session_state.view = "explore"
                 st.rerun()
@@ -311,16 +365,199 @@ def main():
     
     elif st.session_state.view == "explore":
         # Load processed data
-        documents, entities, relationships = load_processed_data()
+        entities, relationships = load_processed_data()
         
         # Create tabs for different views
-        tab1, tab2 = st.tabs(["Documents", "Entities & Relationships"])
+        tab1, tab2, tab3 = st.tabs(["Documents", "Chunks", "Entities & Relationships"])
         
         with tab1:
-            # Display document explorer
-            document_explorer(documents)
-        
+            # Display document explorer with placeholder data
+            # Note: We don't have a central documents repository yet
+            document_explorer([])
+            
         with tab2:
+            # Display chunk explorer
+            st.markdown("""
+            <h2 style='color: #1E3A8A; margin-bottom: 0.5rem;'>Chunk Explorer</h2>
+            <p style='color: #64748B; margin-bottom: 1rem;'>
+                Explore individual chunks created from your documents and stored in the vector database.
+            </p>
+            """, unsafe_allow_html=True)
+            
+            # Initialize retriever to access chunks
+            retriever = QueryHandler().retriever
+            
+            # Get collection info
+            collection_info = retriever.get_collection_info()
+            
+            if collection_info.get('exists', False):
+                chunk_count = collection_info.get('points_count', 0)
+                st.success(f"Found {chunk_count:,} chunks in the vector database.")
+                
+                # Create a card with collection stats
+                st.markdown(
+                    f"""
+                    <div style="background-color: #f8f9fa; border-radius: 8px; padding: 15px; margin-bottom: 20px;">
+                        <div style="display: flex; justify-content: space-between;">
+                            <div><strong>Collection:</strong> {collection_info.get('name')}</div>
+                            <div><strong>Vectors:</strong> {chunk_count:,}</div>
+                            <div><strong>Dimensions:</strong> {collection_info.get('vector_size')}</div>
+                            <div><strong>Distance:</strong> {collection_info.get('distance')}</div>
+                        </div>
+                    </div>
+                    """,
+                    unsafe_allow_html=True
+                )
+                
+                # Let user select how many chunks to view
+                num_chunks = st.slider("Number of chunks to view", 10, min(100, chunk_count), 20)
+                
+                # Filter options
+                col1, col2 = st.columns(2)
+                with col1:
+                    search_text = st.text_input("Search in chunks", placeholder="Enter text to search for...")
+                
+                with col2:
+                    doc_filter = st.text_input("Filter by document", placeholder="Enter document name...")
+                
+                # Get chunks
+                if chunk_count > 0:
+                    with st.spinner("Fetching chunks..."):
+                        chunks = retriever.get_chunks(
+                            limit=num_chunks,
+                            search_text=search_text if search_text else None,
+                            document_filter=doc_filter if doc_filter else None
+                        )
+                    
+                    if chunks:
+                        # Let user choose display mode
+                        display_mode = st.radio(
+                            "Display mode",
+                            ["Simple", "Card", "Detailed"],
+                            horizontal=True,
+                            index=1
+                        )
+                        
+                        # Display chunks based on selected mode
+                        if display_mode == "Simple":
+                            # Simple list view
+                            for i, chunk in enumerate(chunks):
+                                document_id = chunk['metadata'].get('document_id', 'Unknown')
+                                file_name = chunk['metadata'].get('file_name', 'Unknown')
+                                page_num = chunk['metadata'].get('page_num', None)
+                                
+                                # Create expander with summary information
+                                page_info = f", Page {page_num}" if page_num else ""
+                                with st.expander(f"Chunk {i+1}: {file_name}{page_info}"):
+                                    st.text_area(
+                                        f"Content",
+                                        value=chunk['text'],
+                                        height=200,
+                                        key=f"chunk_{i}"
+                                    )
+                        
+                        elif display_mode == "Card":
+                            # Card view with highlighting
+                            for i, chunk in enumerate(chunks):
+                                document_id = chunk['metadata'].get('document_id', 'Unknown')
+                                file_name = chunk['metadata'].get('file_name', 'Unknown')
+                                page_num = chunk['metadata'].get('page_num', None)
+                                chunk_id = chunk['id']
+                                
+                                # Create expander with card styling
+                                page_info = f", Page {page_num}" if page_num else ""
+                                with st.expander(f"Chunk {i+1}: {file_name}{page_info}", expanded=i==0):
+                                    # Header with metadata
+                                    st.markdown(
+                                        f"""
+                                        <div style="background-color: #f1f5f9; padding: 8px; border-radius: 4px; margin-bottom: 10px;">
+                                            <div><strong>ID:</strong> {chunk_id}</div>
+                                            <div><strong>Document:</strong> {document_id}</div>
+                                            <div><strong>File:</strong> {file_name}</div>
+                                            {f"<div><strong>Page:</strong> {page_num}</div>" if page_num else ""}
+                                        </div>
+                                        """,
+                                        unsafe_allow_html=True
+                                    )
+                                    
+                                    # Highlight search terms if provided
+                                    if search_text and search_text.strip():
+                                        # Add HTML highlighting for search term
+                                        import re
+                                        pattern = re.compile(f"({re.escape(search_text)})", re.IGNORECASE)
+                                        highlighted_content = pattern.sub(r'<span style="background-color: #FFFF00; font-weight: bold;">\1</span>', chunk['text'])
+                                        
+                                        # Display with highlighted search terms
+                                        st.markdown(
+                                            f"<div style='border: 1px solid #e2e8f0; border-radius: 4px; padding: 12px; margin-top: 10px; font-family: monospace; white-space: pre-wrap; background-color: white;'>{highlighted_content}</div>",
+                                            unsafe_allow_html=True
+                                        )
+                                    else:
+                                        # Regular display
+                                        st.markdown(
+                                            f"<div style='border: 1px solid #e2e8f0; border-radius: 4px; padding: 12px; margin-top: 10px; font-family: monospace; white-space: pre-wrap; background-color: white;'>{chunk['text']}</div>",
+                                            unsafe_allow_html=True
+                                        )
+                        
+                        else:  # Detailed view
+                            # Full detailed view with all metadata
+                            for i, chunk in enumerate(chunks):
+                                document_id = chunk['metadata'].get('document_id', 'Unknown')
+                                file_name = chunk['metadata'].get('file_name', 'Unknown')
+                                page_num = chunk['metadata'].get('page_num', None)
+                                chunk_id = chunk['id']
+                                
+                                # Create expander with detailed information
+                                page_info = f", Page {page_num}" if page_num else ""
+                                with st.expander(f"Chunk {i+1}: {file_name}{page_info}", expanded=i==0):
+                                    # Two columns for metadata and content
+                                    col1, col2 = st.columns([1, 2])
+                                    
+                                    with col1:
+                                        st.markdown("#### Metadata")
+                                        # Display all metadata
+                                        for key, value in chunk['metadata'].items():
+                                            if key != 'document_metadata':  # Skip nested metadata
+                                                st.markdown(f"**{key}:** {value}")
+                                        
+                                        # Display document metadata if available
+                                        doc_metadata = chunk['metadata'].get('document_metadata', {})
+                                        if doc_metadata:
+                                            st.markdown("#### Document Metadata")
+                                            for key, value in doc_metadata.items():
+                                                st.markdown(f"**{key}:** {value}")
+                                    
+                                    with col2:
+                                        st.markdown("#### Content")
+                                        # Highlight search terms if provided
+                                        if search_text and search_text.strip():
+                                            # Add HTML highlighting for search term
+                                            import re
+                                            pattern = re.compile(f"({re.escape(search_text)})", re.IGNORECASE)
+                                            highlighted_content = pattern.sub(r'<span style="background-color: #FFFF00; font-weight: bold;">\1</span>', chunk['text'])
+                                            
+                                            # Display with highlighted search terms
+                                            st.markdown(
+                                                f"<div style='border: 1px solid #e2e8f0; border-radius: 4px; padding: 12px; height: 300px; overflow-y: auto; font-family: monospace; white-space: pre-wrap; background-color: white;'>{highlighted_content}</div>",
+                                                unsafe_allow_html=True
+                                            )
+                                        else:
+                                            # Regular display with text area
+                                            st.text_area(
+                                                "Content",
+                                                value=chunk['text'],
+                                                height=300,
+                                                key=f"chunk_detail_{i}"
+                                            )
+                    else:
+                        st.info("No chunks match your search criteria.")
+            else:
+                st.warning("No vector collection found. Please process documents first.")
+                
+                if 'error' in collection_info:
+                    st.error(f"Error connecting to vector database: {collection_info['error']}")
+        
+        with tab3:
             # Handle entity selection
             def select_entity(entity_id):
                 st.session_state.selected_entity = entity_id
@@ -334,7 +571,7 @@ def main():
         # Display entity profile
         if st.session_state.selected_entity:
             # Load entities and relationships
-            _, entities, relationships = load_processed_data()
+            entities, relationships = load_processed_data()
             
             # Find entity by ID
             entity_data = None

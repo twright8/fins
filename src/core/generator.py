@@ -1,12 +1,15 @@
 """
-Generation module using Aphrodite for LLM-based text generation.
+Generation module supporting multiple LLM providers for text generation.
 """
 import sys
 import os
 from pathlib import Path
 import traceback
 import time
+import json
+import requests
 from typing import List, Dict, Any, Optional
+from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type
 
 # Add parent directory to sys.path to enable imports from project root
 sys.path.append(str(Path(__file__).resolve().parent.parent.parent))
@@ -18,41 +21,57 @@ logger = setup_logger(__name__)
 
 class Generator:
     """
-    Text generator using Aphrodite LLM.
+    Text generator supporting multiple providers (Aphrodite local and DeepSeek API).
     """
     
     def __init__(self):
-        """Initialize the generator."""
-        # LLM configuration
-        self.model_name = CONFIG["models"]["llm_model"]
+        """Initialize the generator with the configured provider."""
+        # Get provider from config
+        self.provider = CONFIG["generation"]["provider"]
+        
+        # Common generation parameters
         self.temperature = CONFIG["generation"]["temperature"]
         self.max_tokens = CONFIG["generation"]["max_tokens"]
         self.top_p = CONFIG["generation"]["top_p"]
         self.top_k = CONFIG["generation"]["top_k"]
         self.presence_penalty = CONFIG["generation"]["presence_penalty"]
-        self.max_model_len = CONFIG["generation"]["max_model_len"]
-        self.gpu_memory_utilization = CONFIG["generation"]["gpu_memory_utilization"]
-        self.quantization = CONFIG["generation"]["quantization"]
         
-        # Model instance
-        self.model = None
-        self.sampling_params = None
-        self.model_loaded = False
+        # Aphrodite specific attributes
+        self.aphrodite_model = None
+        self.aphrodite_sampling_params = None
+        self.aphrodite_loaded = False
         
-        logger.info(f"Initializing Generator with model={self.model_name}")
+        # DeepSeek specific attributes
+        self.deepseek_config = CONFIG["generation"]["deepseek"]
+        self.deepseek_api_key = self.deepseek_config["api_key"]
+        self.deepseek_available = bool(self.deepseek_api_key.strip())
+        
+        # Check if DeepSeek should be used but API key is missing
+        if self.provider == "deepseek" and not self.deepseek_available:
+            logger.warning("DeepSeek selected as provider but API key is missing. Falling back to Aphrodite.")
+            self.provider = "aphrodite"
+        
+        logger.info(f"Initializing Generator with provider={self.provider}")
+        
+        # Load Aphrodite model if it's the selected provider
+        if self.provider == "aphrodite":
+            self._load_aphrodite()
     
-    def _load_model(self) -> bool:
+    def _load_aphrodite(self) -> bool:
         """
         Load the LLM model using Aphrodite.
         
         Returns:
             bool: Success status
         """
-        if self.model_loaded:
+        if self.aphrodite_loaded:
             return True
         
         try:
-            logger.info(f"Loading model with Aphrodite: {self.model_name}")
+            aphrodite_config = CONFIG["generation"]["aphrodite"]
+            model_name = aphrodite_config["model"]
+            
+            logger.info(f"Loading model with Aphrodite: {model_name}")
             
             try:
                 from aphrodite import LLM, SamplingParams
@@ -61,20 +80,20 @@ class Generator:
                 return False
             
             aphrodite_kwargs = {
-                "model": self.model_name,
+                "model": model_name,
                 "trust_remote_code": True,
                 "dtype": "half",  # Use half precision
-                "max_model_len": self.max_model_len,
+                "max_model_len": aphrodite_config["max_model_len"],
                 "tensor_parallel_size": 1,  # Assuming single GPU for this model size
-                "gpu_memory_utilization": self.gpu_memory_utilization,
-                "quantization": self.quantization,
+                "gpu_memory_utilization": aphrodite_config["gpu_memory_utilization"],
+                "quantization": aphrodite_config["quantization"],
                 "cpu_offload_gb": 0  # Keep model on GPU
             }
             
             logger.info(f"Starting Aphrodite with options: {aphrodite_kwargs}")
-            self.model = LLM(**aphrodite_kwargs)
+            self.aphrodite_model = LLM(**aphrodite_kwargs)
             
-            self.sampling_params = lambda: SamplingParams(
+            self.aphrodite_sampling_params = lambda: SamplingParams(
                 temperature=self.temperature,
                 max_tokens=self.max_tokens,
                 top_p=self.top_p,
@@ -82,8 +101,8 @@ class Generator:
                 presence_penalty=self.presence_penalty
             )
             
-            self.model_loaded = True
-            logger.info(f"Successfully loaded model: {self.model_name}")
+            self.aphrodite_loaded = True
+            logger.info(f"Successfully loaded model: {model_name}")
             log_memory_usage(logger)
             
             return True
@@ -93,9 +112,80 @@ class Generator:
             logger.error(traceback.format_exc())
             return False
     
+    @retry(
+        stop=stop_after_attempt(3),
+        wait=wait_exponential(multiplier=1, min=2, max=10),
+        retry=retry_if_exception_type((requests.exceptions.RequestException, requests.exceptions.Timeout))
+    )
+    def _call_deepseek_api(self, prompt: str) -> str:
+        """
+        Call the DeepSeek API to generate text.
+        
+        Args:
+            prompt (str): Input prompt
+            
+        Returns:
+            str: Generated text
+        """
+        if not self.deepseek_available:
+            logger.error("DeepSeek API key not configured")
+            return "Error: DeepSeek API key not configured"
+        
+        try:
+            headers = {
+                "Authorization": f"Bearer {self.deepseek_api_key}",
+                "Content-Type": "application/json"
+            }
+            
+            payload = {
+                "model": self.deepseek_config["model"],
+                "messages": [{"role": "user", "content": prompt}],
+                "temperature": self.temperature,
+                "max_tokens": self.max_tokens,
+                "top_p": self.top_p,
+                "stream": False
+            }
+            
+            url = f"{self.deepseek_config['api_base']}/chat/completions"
+            
+            response = requests.post(
+                url,
+                headers=headers,
+                json=payload,
+                timeout=self.deepseek_config["timeout"]
+            )
+            
+            # Raise an exception if the request was unsuccessful
+            response.raise_for_status()
+            
+            # Parse the response
+            result = response.json()
+            
+            # Check for errors in the response
+            if "error" in result:
+                logger.error(f"DeepSeek API error: {result['error']}")
+                return f"Error from DeepSeek API: {result['error']}"
+            
+            # Extract the generated text
+            if ("choices" in result and 
+                len(result["choices"]) > 0 and 
+                "message" in result["choices"][0] and
+                "content" in result["choices"][0]["message"]):
+                return result["choices"][0]["message"]["content"]
+            else:
+                logger.error(f"Unexpected response structure from DeepSeek API: {result}")
+                return "Error: Unexpected response structure from DeepSeek API"
+            
+        except requests.exceptions.RequestException as e:
+            logger.error(f"Request error calling DeepSeek API: {str(e)}")
+            raise  # Let the retry decorator handle this
+        except Exception as e:
+            logger.error(f"Error calling DeepSeek API: {str(e)}")
+            return f"Error in text generation: {str(e)}"
+    
     def generate(self, prompt: str) -> str:
         """
-        Generate text based on the given prompt.
+        Generate text based on the given prompt using the configured provider.
         
         Args:
             prompt (str): Input prompt
@@ -111,22 +201,18 @@ class Generator:
             if not prompt.strip():
                 return ""
             
-            # Load model if not already loaded
-            if not self.model_loaded:
-                success = self._load_model()
-                if not success:
-                    return "Error: Failed to load model"
-            
-            # Generate text
-            logger.info(f"Generating text for prompt of length {len(prompt)}")
-            response = self.model.generate(prompt, self.sampling_params())
-            
-            # Extract generated text
-            generated_text = response.outputs[0].text
+            # Generate using the selected provider
+            if self.provider == "aphrodite":
+                generated_text = self._generate_with_aphrodite(prompt)
+            elif self.provider == "deepseek":
+                generated_text = self._call_deepseek_api(prompt)
+            else:
+                logger.error(f"Unknown provider: {self.provider}")
+                return f"Error: Unknown provider '{self.provider}'"
             
             # Log timing
             elapsed_time = time.time() - start_time
-            logger.info(f"Generation completed in {elapsed_time:.2f}s. Generated {len(generated_text)} characters.")
+            logger.info(f"Generation completed in {elapsed_time:.2f}s using {self.provider}. Generated {len(generated_text)} characters.")
             
             return generated_text
             
@@ -134,6 +220,29 @@ class Generator:
             logger.error(f"Error in text generation: {str(e)}")
             logger.error(traceback.format_exc())
             return f"Error in text generation: {str(e)}"
+    
+    def _generate_with_aphrodite(self, prompt: str) -> str:
+        """
+        Generate text using local Aphrodite instance.
+        
+        Args:
+            prompt (str): Input prompt
+            
+        Returns:
+            str: Generated text
+        """
+        # Load model if not already loaded
+        if not self.aphrodite_loaded:
+            success = self._load_aphrodite()
+            if not success:
+                return "Error: Failed to load Aphrodite model"
+        
+        # Generate text
+        logger.info(f"Generating text with Aphrodite for prompt of length {len(prompt)}")
+        response = self.aphrodite_model.generate(prompt, self.aphrodite_sampling_params())
+        
+        # Extract generated text
+        return response.outputs[0].text
     
     def generate_with_context(self, query: str, retrieved_chunks: List[Dict[str, Any]]) -> str:
         """
@@ -160,7 +269,7 @@ class Generator:
             # Construct prompt
             prompt = self._construct_rag_prompt(query, context)
             
-            # Generate response
+            # Generate response using the selected provider
             response = self.generate(prompt)
             
             return response

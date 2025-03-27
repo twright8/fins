@@ -1,6 +1,7 @@
 """
 Logging module for the Anti-Corruption RAG system.
 Configures logging for the application and provides utility functions.
+Enhanced with root logger configuration for better visibility of library operations.
 """
 import os
 import logging
@@ -33,6 +34,10 @@ log_queue = queue.Queue(-1)  # No limit on size
 # Configure queue handler for subprocess logging
 queue_handler = logging.handlers.QueueHandler(log_queue)
 
+# Configure the root logger for library visibility
+root_logger = logging.getLogger()
+root_logger.setLevel(logging.INFO)  # Set to INFO to capture most library messages
+
 # Main listener to handle log records from the queue
 def log_listener(queue, log_file):
     """
@@ -47,13 +52,16 @@ def log_listener(queue, log_file):
     file_handler.setFormatter(logging.Formatter(LOG_FORMAT, DATE_FORMAT))
     
     # Set up console handler
-    console_handler = logging.StreamHandler()
+    console_handler = logging.StreamHandler(sys.stdout)
     console_handler.setFormatter(logging.Formatter(LOG_FORMAT, DATE_FORMAT))
     
     # Root logger with both handlers
     root = logging.getLogger()
     root.addHandler(file_handler)
     root.addHandler(console_handler)
+    
+    # Set root logger level to capture library logs
+    root.setLevel(logging.INFO)
     
     # Process log records from the queue
     while True:
