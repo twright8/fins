@@ -1,0 +1,53 @@
+version: '3.8'
+
+services:
+  qdrant:
+    image: qdrant/qdrant:latest
+    container_name: qdrant-server
+    ports:
+      - "6333:6333"  # gRPC interface
+      - "6334:6334"  # HTTP interface
+    volumes:
+      - ./data/qdrant_data:/qdrant/storage
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:6334/healthz"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 40s
+    networks:
+      - ti-rag-network
+
+  rag-app:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: ti-rag-app
+    ports:
+      - "8501:8501"  # Streamlit port
+    volumes:
+      - .:/app
+      - ~/.cache/huggingface:/root/.cache/huggingface  # HuggingFace cache
+    depends_on:
+      - qdrant
+    environment:
+      - QDRANT_HOST=qdrant
+      - QDRANT_PORT=6333
+      - STREAMLIT_SERVER_PORT=8501
+      - STREAMLIT_SERVER_ADDRESS=0.0.0.0
+    runtime: nvidia
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
+    restart: unless-stopped
+    networks:
+      - ti-rag-network
+
+networks:
+  ti-rag-network:
+    driver: bridge

@@ -1,0 +1,48 @@
+# Core Libraries
+torch==2.4.0
+streamlit>=1.27.0
+python-dotenv>=1.0.0
+pyyaml>=6.0
+colorama>=0.4.6
+
+# Document Processing
+PyMuPDF>=1.22.5  # For PDF parsing
+python-docx>=0.8.11  # For DOCX parsing 
+pandas>=2.0.0  # For CSV/Excel parsing
+pytesseract>=0.3.10  # For OCR
+Pillow>=10.0.0  # For image processing
+
+# NLP & ML Libraries
+sentencepiece==0.2.0 # For tokenization
+protobuf>=3.20.0  # Required by some ML libraries
+
+# Entity Extraction & NER
+flair>=0.15.1  # For NER and relation extraction
+
+# Vector DB & Embedding
+qdrant-client>=1.5.0  # Vector database client
+rank-bm25>=0.2.2  # For BM25 search
+embed  # For Infinity Embeddings
+langchain-experimental
+langchain-huggingface
+langchain
+
+
+# Resource Management
+psutil>=5.9.0  # For resource monitoring
+
+# Visualization
+plotly>=5.18.0  # For interactive visualizations
+networkx>=3.1  # For network/graph visualization
+pyvis>=0.3.2  # For interactive network visualization
+
+# Docker Support
+docker>=6.1.3  # For Docker integration
+
+# Utilities
+tqdm>=4.66.1  # For progress bars
+uuid>=1.30  # For generating unique IDs
+loguru>=0.7.0  # For advanced logging
+
+--extra-index-url https://downloads.pygmalion.chat/whl
+aphrodite-engine>=0.6.3

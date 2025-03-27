@@ -1,0 +1,54 @@
+---
+# Document Processing
+document_processing:
+  chunk_size: 512
+  chunk_overlap: 50
+  ocr_parallel_jobs: 4
+
+# Models
+models:
+  embedding_model: "intfloat/multilingual-e5-base"
+  reranking_model: "mixedbread-ai/mxbai-rerank-xsmall-v1"
+  ner_model: "flair/ner-english-ontonotes-fast"
+  coref_model: "maverick-coref"
+  llm_model: "Qwen/Qwen2.5-0.5B-Instruct"
+
+# Retrieval
+retrieval:
+  top_k_vector: 20
+  top_k_bm25: 10
+  top_k_hybrid: 15
+  top_k_rerank: 5
+  vector_weight: 0.7
+  bm25_weight: 0.3
+
+# LLM Generation (Aphrodite)
+generation:
+  temperature: 0.3
+  max_tokens: 1024
+  top_p: 0.9
+  top_k: 50
+  presence_penalty: 0.0
+  max_model_len: 8192
+  gpu_memory_utilization: 0.85
+  quantization: "fp8"
+
+# Qdrant Vector DB
+qdrant:
+  host: "localhost"
+  port: 6333
+  collection_name: "anti_corruption_docs"
+  vector_size: 768
+
+# Entity Extraction
+entity_extraction:
+  confidence_threshold: 0.3
+  relationship_threshold: 0.3
+
+# UI
+ui:
+  page_title: "Anti-Corruption RAG System"
+  page_icon: "🔍"
+  theme_color: "#1E3A8A"
+  accent_color: "#3B82F6"
+  max_upload_size_mb: 200
