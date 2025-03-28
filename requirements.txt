@@ -18,6 +18,7 @@ protobuf>=3.20.0  # Required by some ML libraries
 
 # Entity Extraction & NER
 flair>=0.15.1  # For NER and relation extraction
+fastcoref>=2.1.6  # For coreference resolution
 
 # Vector DB & Embedding
 qdrant-client>=1.5.0  # Vector database client

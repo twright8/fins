@@ -382,7 +382,8 @@ def entity_explorer(entities: List[Dict[str, Any]], relationships: List[Dict[str
         selected_types = st.multiselect(
             "Filter by entity type",
             options=entity_types,
-            default=entity_types
+            default=entity_types,
+            key="entity_list_type_filter"
         )
         
         # Filter entities
@@ -447,7 +448,8 @@ def entity_explorer(entities: List[Dict[str, Any]], relationships: List[Dict[str
             selected_graph_types = st.multiselect(
                 "Filter by entity type",
                 options=entity_types,
-                default=entity_types
+                default=entity_types,
+                key="entity_graph_type_filter"
             )
         
         with control_col3:
@@ -698,7 +700,8 @@ def entity_explorer(entities: List[Dict[str, Any]], relationships: List[Dict[str
             selected_rel_types = st.multiselect(
                 "Filter by relationship type",
                 options=rel_types,
-                default=rel_types
+                default=rel_types,
+                key="relationship_type_filter"
             )
             
         with col2:

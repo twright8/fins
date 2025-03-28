@@ -25,8 +25,14 @@ class Retriever:
     Retriever that combines BM25 and vector search for hybrid retrieval.
     """
     
-    def __init__(self):
-        """Initialize the retriever."""
+    def __init__(self, lazy_init=False, qdrant_only=False):
+        """
+        Initialize the retriever.
+        
+        Args:
+            lazy_init (bool): If True, don't load embedding models on initialization
+            qdrant_only (bool): If True, only initialize Qdrant connection without embedding models
+        """
         # BM25 configuration
         self.bm25_dir = DATA_DIR / "bm25_indices"
         self.bm25_index = None
@@ -56,11 +62,17 @@ class Retriever:
                    f"collection={self.qdrant_collection}, "
                    f"embedding_model={self.embedding_model_name}")
         
-        # Load BM25 index
+        # Load BM25 index (this is quick)
         self._load_bm25_index()
         
-        # Load embedding models at initialization
-        self._load_embedding_model()
+        # Handle initialization based on parameters
+        if qdrant_only:
+            logger.info("Initializing with Qdrant only - embedding models will not be loaded")
+        elif not lazy_init:
+            logger.info("Loading embedding models during initialization")
+            self._load_embedding_model()
+        else:
+            logger.info("Using lazy initialization - embedding models will be loaded on first use")
     
     def _load_bm25_index(self) -> bool:
         """
@@ -143,10 +155,19 @@ class Retriever:
         if self.embed_register is not None:
             logger.info("Unloading embedding models")
             
-            # Stop the register
-            self.embed_register.stop()
+            try:
+                # Safely stop the register, handling potential attribute errors
+                self.embed_register.stop()
+            except AttributeError as ae:
+                # Handle known issue with SyncEngineArray.__del__ in infinity_emb
+                logger.warning(f"Attribute error when stopping infinity embedding model: {ae}")
+                print(f"[WARNING] Known issue with infinity-embed cleanup: {ae}")
+                # We'll still try to clean up as much as possible
+            except Exception as e:
+                # Log other exceptions but continue cleanup
+                logger.error(f"Error stopping infinity embedding model: {e}")
             
-            # Delete the register reference
+            # Delete the register reference regardless of stop() success
             del self.embed_register
             self.embed_register = None
             
@@ -173,19 +194,28 @@ class Retriever:
             list: List of chunks with their metadata
         """
         try:
-            from qdrant_client import QdrantClient
+            import time
+            start_time = time.time()
             
-            # Connect to Qdrant
-            client = QdrantClient(host=self.qdrant_host, port=self.qdrant_port)
+            from qdrant_client import QdrantClient, models
+            from qdrant_client.http import exceptions as qdrant_exceptions
+            
+            # Connect to Qdrant with timeout settings
+            client = QdrantClient(
+                host=self.qdrant_host, 
+                port=self.qdrant_port,
+                timeout=5.0  # 5 second timeout for operations
+            )
             
             # Build filter if needed
             filter_conditions = []
             
             if search_text:
+                # Use match instead of text for better performance
                 filter_conditions.append({
                     "must": [{
                         "key": "text",
-                        "match": {"text": search_text}
+                        "match": {"value": search_text}
                     }]
                 })
             
@@ -193,35 +223,62 @@ class Retriever:
                 filter_conditions.append({
                     "must": [{
                         "key": "file_name",
-                        "match": {"text": document_filter}
+                        "match": {"value": document_filter}
                     }]
                 })
             
-            # Combine filters
-            filter_obj = {"must": filter_conditions} if filter_conditions else None
+            # Combine filters or use empty filter if none provided
+            filter_obj = models.Filter(must=filter_conditions) if filter_conditions else None
             
-            # Get chunks
-            scroll_result = client.scroll(
-                collection_name=self.qdrant_collection,
-                limit=limit,
-                with_payload=True,
-                with_vectors=False,
-                filter=filter_obj
-            )
+            # Validate collection exists before querying to avoid hanging
+            collections = client.get_collections().collections
+            collection_names = [c.name for c in collections]
+            if self.qdrant_collection not in collection_names:
+                logger.warning(f"Collection {self.qdrant_collection} does not exist")
+                return []
+            
+            # Get chunks with timeout protection
+            try:
+                scroll_result = client.scroll(
+                    collection_name=self.qdrant_collection,
+                    limit=limit,
+                    with_payload=True,
+                    with_vectors=False,
+                    filter=filter_obj,
+                    timeout=10  # 10 second timeout for scroll operation
+                )
+                
+                points = scroll_result[0]
+            except qdrant_exceptions.UnexpectedResponse as e:
+                logger.error(f"Qdrant returned unexpected response: {e}")
+                return []
+            except qdrant_exceptions.TimeoutError:
+                logger.error("Qdrant query timed out")
+                return []
             
             # Format results
             chunks = []
-            for point in scroll_result[0]:
+            for point in points:
+                # Make sure payload exists to avoid errors
+                if not hasattr(point, 'payload') or point.payload is None:
+                    continue
+                
                 chunks.append({
                     'id': point.id,
                     'text': point.payload.get('text', ''),
                     'metadata': {k: v for k, v in point.payload.items() if k != 'text'}
                 })
             
+            # Log performance
+            elapsed_time = time.time() - start_time
+            logger.info(f"Retrieved {len(chunks)} chunks in {elapsed_time:.2f}s")
+            
             return chunks
             
         except Exception as e:
+            import traceback
             logger.error(f"Error retrieving chunks: {e}")
+            logger.error(traceback.format_exc())
             return []
             
     def get_collection_info(self) -> Dict[str, Any]:
@@ -232,31 +289,61 @@ class Retriever:
             dict: Collection information including point count
         """
         try:
+            import time
+            start_time = time.time()
+            
             from qdrant_client import QdrantClient
+            from qdrant_client.http import exceptions as qdrant_exceptions
             
-            # Connect to Qdrant
-            client = QdrantClient(host=self.qdrant_host, port=self.qdrant_port)
+            # Connect to Qdrant with timeout
+            client = QdrantClient(
+                host=self.qdrant_host, 
+                port=self.qdrant_port,
+                timeout=3.0  # 3 second timeout
+            )
             
-            # Check if collection exists
-            collections = client.get_collections().collections
-            collection_names = [c.name for c in collections]
-            
-            if self.qdrant_collection in collection_names:
-                # Get collection info
-                collection_info = client.get_collection(self.qdrant_collection)
+            try:
+                # Check if collection exists - with timeout
+                collections_response = client.get_collections(timeout=3.0)
+                collections = collections_response.collections
+                collection_names = [c.name for c in collections]
                 
-                return {
-                    'exists': True,
-                    'name': self.qdrant_collection,
-                    'points_count': collection_info.points_count,
-                    'vector_size': collection_info.config.params.vectors.size,
-                    'distance': str(collection_info.config.params.vectors.distance)
-                }
-            else:
-                return {'exists': False}
+                if self.qdrant_collection in collection_names:
+                    # Get collection info - with timeout
+                    collection_info = client.get_collection(
+                        collection_name=self.qdrant_collection,
+                        timeout=3.0
+                    )
+                    
+                    # Get only what we need to avoid potential serialization issues
+                    result = {
+                        'exists': True,
+                        'name': self.qdrant_collection,
+                        'points_count': getattr(collection_info, 'points_count', 0),
+                        'vector_size': getattr(collection_info.config.params.vectors, 'size', 0),
+                        'distance': str(getattr(collection_info.config.params.vectors, 'distance', 'unknown'))
+                    }
+                    
+                    # Log performance
+                    elapsed_time = time.time() - start_time
+                    logger.info(f"Retrieved collection info in {elapsed_time:.2f}s")
+                    
+                    return result
+                else:
+                    logger.warning(f"Collection {self.qdrant_collection} does not exist")
+                    return {'exists': False}
+                    
+            except qdrant_exceptions.UnexpectedResponse as e:
+                logger.error(f"Qdrant returned unexpected response: {e}")
+                return {'exists': False, 'error': f"Unexpected response: {str(e)}"}
+            except qdrant_exceptions.TimeoutError:
+                logger.error("Qdrant query timed out")
+                return {'exists': False, 'error': "Connection timed out"}
             
         except Exception as e:
+            import traceback
             logger.error(f"Error getting collection info: {e}")
+            logger.error(traceback.format_exc())
             return {'exists': False, 'error': str(e)}
     
     def shutdown(self):

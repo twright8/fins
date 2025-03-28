@@ -25,28 +25,36 @@ class DocumentChunker:
     Document chunker that implements semantic chunking.
     """
     
-    def __init__(self, status_queue=None):
+    def __init__(self, status_queue=None, load_model_immediately=False, embedding_model=None):
         """
         Initialize document chunker.
         
         Args:
             status_queue (Queue, optional): Queue for status updates.
+            load_model_immediately (bool): Whether to load the embedding model immediately.
+            embedding_model: A pre-loaded embedding model to use instead of loading a new one.
         """
         self.chunk_size = CONFIG["document_processing"]["chunk_size"]
         self.chunk_overlap = CONFIG["document_processing"]["chunk_overlap"]
         self.embedding_model_name = CONFIG["models"]["embedding_model"]
         self.status_queue = status_queue
-        self.embedding_model = None
+        
+        # Use the provided model if available
+        self.embedding_model = embedding_model
         
         logger.info(f"Initializing DocumentChunker with chunk_size={self.chunk_size}, "
                    f"chunk_overlap={self.chunk_overlap}, embedding_model={self.embedding_model_name}")
         
-        # Models will be loaded on demand to optimize memory usage
+        print(f"[CHUNKER] Initializing with {'pre-loaded' if embedding_model else 'no'} embedding model")
         
         if self.status_queue:
             self.status_queue.put(('status', 'Document chunker initialized'))
         
         log_memory_usage(logger)
+        
+        # Load the model immediately if requested and not already provided
+        if load_model_immediately and not embedding_model:
+            self.load_model()
     
     def _update_status(self, status, progress=None):
         """
@@ -65,12 +73,17 @@ class DocumentChunker:
         # Always log status
         logger.info(status)
     
-    def _load_embedding_model(self):
+    def load_model(self):
         """
         Load the embedding model if not already loaded.
         """
         if self.embedding_model is not None:
+            logger.info("Embedding model already loaded, skipping load")
+            print(f"[CHUNKER] Embedding model already loaded, skipping load")
             return
+        
+        print(f"[CHUNKER] ===== STARTING MODEL LOAD =====")
+        logger.info("===== STARTING MODEL LOAD =====")
         
         try:
             from langchain_huggingface import HuggingFaceEmbeddings
@@ -117,6 +130,10 @@ class DocumentChunker:
             
             # Try to create the model with different parameter sets
             # (to handle different versions of langchain_huggingface)
+            model_creation_start = time.time()
+            print(f"[CHUNKER] Creating HuggingFaceEmbeddings instance at {model_creation_start:.2f}...")
+            logger.info(f"Creating HuggingFaceEmbeddings instance...")
+            
             try:
                 # First try with the more detailed configuration
                 self.embedding_model = HuggingFaceEmbeddings(
@@ -128,14 +145,25 @@ class DocumentChunker:
                     },
                     encode_kwargs={"normalize_embeddings": True},
                 )
-                print(f"[INFO] Created embedding model with detailed configuration")
+                model_creation_time = time.time() - model_creation_start
+                print(f"[CHUNKER] Created embedding model with detailed configuration in {model_creation_time:.2f}s")
+                logger.info(f"Created embedding model with detailed configuration in {model_creation_time:.2f}s")
             except TypeError as te:
                 # Fall back to simpler configuration if the above fails
                 print(f"[WARNING] Detailed configuration failed ({str(te)}), falling back to basic configuration")
+                logger.warning(f"Detailed configuration failed: {te}")
+                
+                fallback_start = time.time()
+                print(f"[CHUNKER] Trying fallback configuration at {fallback_start:.2f}...")
+                logger.info(f"Trying fallback configuration...")
+                
                 self.embedding_model = HuggingFaceEmbeddings(
                     model_name=self.embedding_model_name,
                 )
-                print(f"[INFO] Created embedding model with basic configuration")
+                
+                fallback_time = time.time() - fallback_start
+                print(f"[CHUNKER] Created embedding model with basic configuration in {fallback_time:.2f}s")
+                logger.info(f"Created embedding model with basic configuration in {fallback_time:.2f}s")
             
             elapsed_time = time.time() - start_time
             
@@ -167,23 +195,34 @@ class DocumentChunker:
             traceback.print_exc()
             raise
     
-    def _unload_embedding_model(self):
+    def shutdown(self):
         """
         Unload embedding model to free up memory.
         """
         if self.embedding_model is not None:
+            print(f"[CHUNKER] ===== STARTING MODEL UNLOAD =====")
+            logger.info("===== STARTING MODEL UNLOAD =====")
             self._update_status("Unloading embedding model")
             
             # Delete the model reference
+            print(f"[CHUNKER] Deleting model reference...")
+            logger.info("Deleting model reference...")
             del self.embedding_model
             self.embedding_model = None
             
             # Clean up CUDA memory
             if torch.cuda.is_available():
+                print(f"[CHUNKER] Clearing CUDA cache...")
+                logger.info("Clearing CUDA cache...")
                 torch.cuda.empty_cache()
             
             # Force garbage collection
+            print(f"[CHUNKER] Running garbage collection...")
+            logger.info("Running garbage collection...")
             gc.collect()
+            
+            print(f"[CHUNKER] ===== MODEL UNLOAD COMPLETE =====")
+            logger.info("===== MODEL UNLOAD COMPLETE =====")
             
             log_memory_usage(logger)
     
@@ -211,18 +250,6 @@ class DocumentChunker:
         chunks = []
         
         try:
-            # Log model loading start
-            model_start = time.time()
-            logger.info("Loading embedding model for chunking...")
-            print(f"[CHUNKER] Loading embedding model...")
-            
-            # Load the embedding model once at the beginning
-            self._load_embedding_model()
-            
-            # Log model loading completion
-            model_time = time.time() - model_start
-            logger.info(f"Embedding model loaded in {model_time:.2f}s")
-            print(f"[CHUNKER] Embedding model loaded in {model_time:.2f}s")
             
             # Process each content item (page or section)
             content_items = document.get('content', [])
@@ -255,8 +282,12 @@ class DocumentChunker:
                 self._update_status(f"Chunking content item {i+1}/{len(content_items)}{page_info}", progress)
                 
                 chunking_start = time.time()
+                print(f"[CHUNKER] Starting semantic chunking for item {i+1} at {chunking_start:.2f}...")
+                logger.info(f"Starting semantic chunking for item {i+1}...")
                 content_chunks = self._semantic_chunking(text)
                 chunking_time = time.time() - chunking_start
+                print(f"[CHUNKER] Semantic chunking for item {i+1} completed in {chunking_time:.2f}s")
+                logger.info(f"Semantic chunking for item {i+1} completed in {chunking_time:.2f}s")
                 
                 # Log chunking details
                 logger.info(f"Item {i+1} chunked into {len(content_chunks)} chunks in {chunking_time:.2f}s")
@@ -316,18 +347,8 @@ class DocumentChunker:
             print(traceback.format_exc())
             raise
         finally:
-            # Log unloading start
-            unload_start = time.time()
-            logger.info("Unloading embedding model...")
-            print(f"[CHUNKER] Unloading embedding model...")
-            
-            # Ensure model is unloaded even if there's an error
-            self._unload_embedding_model()
-            
-            # Log unloading completion
-            unload_time = time.time() - unload_start
-            logger.info(f"Embedding model unloaded in {unload_time:.2f}s")
-            print(f"[CHUNKER] Embedding model unloaded in {unload_time:.2f}s")
+            # We don't unload the model here anymore - it will be unloaded in shutdown()
+            pass
     
     def _semantic_chunking(self, text: str) -> List[str]:
         """
@@ -375,16 +396,41 @@ class DocumentChunker:
                         if large_chunk_count > 1:
                             print(f"[CHUNKING] Processing large chunk {i+1}/{large_chunk_count} with semantic chunker")
                             
-                        # Configure semantic chunker
+                        # Configure semantic chunker with the already loaded model
+                        # Ensure model is loaded
+                        if self.embedding_model is None:
+                            logger.warning("Embedding model not loaded, attempting to load now")
+                            print(f"[CHUNKING] Embedding model not loaded, loading now...")
+                            self.load_model()
+                            print(f"[CHUNKING] Embedding model loaded on-demand")
+                        else:
+                            logger.debug("Using pre-loaded embedding model for semantic chunking")
+                        
+                        splitter_start = time.time()
+                        print(f"[CHUNKING] Creating SemanticChunker at {splitter_start:.2f}...")
+                        logger.info("Creating SemanticChunker instance...")
+                            
                         text_splitter = SemanticChunker(
                             self.embedding_model,
                             breakpoint_threshold_type="percentile",
                             breakpoint_threshold_amount=95.0
                         )
                         
+                        splitter_time = time.time() - splitter_start
+                        print(f"[CHUNKING] SemanticChunker created in {splitter_time:.2f}s")
+                        logger.info(f"SemanticChunker created in {splitter_time:.2f}s")
+                        
                         # Apply semantic chunking
+                        chunking_start = time.time()
+                        print(f"[CHUNKING] Starting create_documents at {chunking_start:.2f}...")
+                        logger.info("Starting create_documents...")
+                        
                         docs = text_splitter.create_documents([chunk])
                         results = [doc.page_content for doc in docs]
+                        
+                        chunking_time = time.time() - chunking_start
+                        print(f"[CHUNKING] create_documents completed in {chunking_time:.2f}s")
+                        logger.info(f"create_documents completed in {chunking_time:.2f}s")
                         
                         print(f"[CHUNKING] Semantic chunker split text of {len(chunk)} chars into {len(results)} chunks")
                         semantic_chunks.extend(results)

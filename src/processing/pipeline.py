@@ -20,8 +20,9 @@ from src.processing.document_chunker import DocumentChunker
 from src.processing.coreference_resolver import CoreferenceResolver
 from src.processing.entity_extractor import EntityExtractor
 from src.processing.indexer import Indexer
+from src.processing.model_manager import ModelManager
 
-def process_documents(file_paths: List[str], status_queue: multiprocessing.Queue) -> bool:
+def process_documents(file_paths: List[str], status_queue: multiprocessing.Queue, preload_models: bool = True) -> bool:
     """
     Main document processing function to be executed in a subprocess.
     Orchestrates the entire pipeline of document processing.
@@ -29,6 +30,7 @@ def process_documents(file_paths: List[str], status_queue: multiprocessing.Queue
     Args:
         file_paths (list): List of paths to documents to process
         status_queue (Queue): Queue for status updates
+        preload_models (bool, optional): Whether to preload all models at the beginning. Defaults to True.
         
     Returns:
         bool: Success status
@@ -43,8 +45,33 @@ def process_documents(file_paths: List[str], status_queue: multiprocessing.Queue
         # Log memory usage at start
         log_memory_usage(logger)
         
+        # Initialize variables for model management
+        model_manager = None
+        models = None
+        
+        # Step 0: Initialize model manager and load all models upfront
+        if preload_models:
+            status_queue.put(('status', "Step 0/6: Model Initialization"))
+            status_queue.put(('progress', 0.0, "Loading all models"))
+            
+            print(f"[PIPELINE] ===== INITIALIZING MODEL MANAGER =====")
+            logger.info("Initializing model manager and preloading all models")
+            model_manager = ModelManager(status_queue=status_queue)
+            
+            model_load_start = time.time()
+            model_manager.load_all_models()
+            model_load_time = time.time() - model_load_start
+            
+            print(f"[PIPELINE] All models loaded in {model_load_time:.2f}s")
+            logger.info(f"All models loaded in {model_load_time:.2f}s")
+            
+            # Pass models to components when initializing them
+            models = model_manager.get_models()
+            print(f"[PIPELINE] Model dictionary keys: {list(models.keys())}")
+            logger.info(f"Model dictionary keys: {list(models.keys())}")
+        
         # Step 1: Document Loading
-        status_queue.put(('status', "Step 1/5: Document Loading"))
+        status_queue.put(('status', "Step 1/6: Document Loading"))
         status_queue.put(('progress', 0.0, "Starting document loading"))
         
         # Initialize document loader
@@ -74,14 +101,25 @@ def process_documents(file_paths: List[str], status_queue: multiprocessing.Queue
         log_memory_usage(logger)
         
         # Step 2: Document Chunking
-        status_queue.put(('status', "Step 2/5: Document Chunking"))
+        status_queue.put(('status', "Step 2/6: Document Chunking"))
         status_queue.put(('progress', 0.2, "Starting document chunking"))
         
-        # Initialize document chunker
+        # Initialize document chunker - reuse loaded model if available
         chunking_start_time = time.time()
         logger.info(f"Initializing document chunker at {chunking_start_time:.2f}")
-        print(f"[PIPELINE] Initializing document chunker")
-        chunker = DocumentChunker(status_queue=status_queue)
+        print(f"[PIPELINE] ===== INITIALIZING DOCUMENT CHUNKER =====")
+        print(f"[PIPELINE] Creating DocumentChunker instance at {time.time():.2f}")
+        
+        chunker_init_start = time.time()
+        embedding_model = models.get("embedding_model") if models else None
+        chunker = DocumentChunker(
+            status_queue=status_queue,
+            embedding_model=embedding_model
+        )
+        chunker_init_time = time.time() - chunker_init_start
+        
+        print(f"[PIPELINE] DocumentChunker instance created in {chunker_init_time:.2f}s")
+        logger.info(f"DocumentChunker instance created in {chunker_init_time:.2f}s")
         
         # Process each document
         all_chunks = []
@@ -119,24 +157,55 @@ def process_documents(file_paths: List[str], status_queue: multiprocessing.Queue
         status_queue.put(('status', f"Created {len(all_chunks)} chunks"))
         log_memory_usage(logger)
         
+        # We don't shutdown the chunker models if we're using the model manager
+        if not preload_models:
+            shutdown_start = time.time()
+            logger.info("Shutting down document chunker and unloading model...")
+            print(f"[PIPELINE] ===== SHUTTING DOWN DOCUMENT CHUNKER =====")
+            print(f"[PIPELINE] Starting chunker shutdown at {shutdown_start:.2f}")
+            chunker.shutdown()
+            shutdown_time = time.time() - shutdown_start
+            logger.info(f"Document chunker shutdown in {shutdown_time:.2f}s")
+            print(f"[PIPELINE] Document chunker shutdown in {shutdown_time:.2f}s")
+            print(f"[PIPELINE] ===== DOCUMENT CHUNKER SHUTDOWN COMPLETE =====")
+        
         # Transition status
         transition_start = time.time()
         logger.info(f"Preparing for coreference resolution at {transition_start:.2f}")
+        print(f"[PIPELINE] ===== TRANSITION TO COREFERENCE RESOLUTION =====")
         print(f"[PIPELINE] Preparing for coreference resolution - initializing resolver")
         status_queue.put(('status', "Transitioning to coreference resolution..."))
         
         # Step 3: Coreference Resolution
-        status_queue.put(('status', "Step 3/5: Coreference Resolution"))
+        status_queue.put(('status', "Step 3/6: Coreference Resolution"))
         status_queue.put(('progress', 0.4, "Starting coreference resolution"))
         logger.info(f"Transition time before coreference resolution: {time.time() - transition_start:.2f}s")
         print(f"[PIPELINE] Starting coreference resolution with {len(all_chunks)} chunks")
         
-        # Initialize coreference resolver
-        resolver = CoreferenceResolver(status_queue=status_queue)
+        # Initialize coreference resolver - reuse loaded model if available
+        print(f"[PIPELINE] Creating CoreferenceResolver instance at {time.time():.2f}")
+        logger.info(f"Creating CoreferenceResolver instance")
+        resolver_init_start = time.time()
+        
+        coref_model = models.get("coref_model") if models else None
+        resolver = CoreferenceResolver(
+            status_queue=status_queue,
+            coref_model=coref_model
+        )
+        
+        resolver_init_time = time.time() - resolver_init_start
+        print(f"[PIPELINE] CoreferenceResolver instance created in {resolver_init_time:.2f}s")
+        logger.info(f"CoreferenceResolver instance created in {resolver_init_time:.2f}s")
         
         try:
-            # Process all chunks
+            # Process all chunks with detailed timing
+            process_chunks_start = time.time()
+            print(f"[PIPELINE] Starting coreference resolution process_chunks at {process_chunks_start:.2f}")
+            logger.info(f"Starting coreference process_chunks")
             resolved_chunks = resolver.process_chunks(all_chunks)
+            process_chunks_time = time.time() - process_chunks_start
+            print(f"[PIPELINE] Coreference process_chunks completed in {process_chunks_time:.2f}s")
+            logger.info(f"Coreference process_chunks completed in {process_chunks_time:.2f}s")
             
             logger.info(f"Applied coreference resolution to {len(resolved_chunks)} chunks")
             status_queue.put(('status', f"Applied coreference resolution"))
@@ -150,15 +219,41 @@ def process_documents(file_paths: List[str], status_queue: multiprocessing.Queue
             return False
         
         # Step 4: Entity Extraction
-        status_queue.put(('status', "Step 4/5: Entity Extraction"))
+        status_queue.put(('status', "Step 4/6: Entity Extraction"))
         status_queue.put(('progress', 0.6, "Starting entity extraction"))
         
-        # Initialize entity extractor
-        extractor = EntityExtractor(status_queue=status_queue)
+        # Initialize entity extractor - reuse loaded models if available
+        print(f"[PIPELINE] ===== INITIALIZING ENTITY EXTRACTOR =====")
+        print(f"[PIPELINE] Creating EntityExtractor instance at {time.time():.2f}")
+        extractor_init_start = time.time()
+        
+        # Get models if available
+        ner_model = models.get("flair_ner_model") if models else None
+        relation_model = models.get("flair_relation_model") if models else None
+        
+        extractor = EntityExtractor(
+            status_queue=status_queue,
+            ner_model=ner_model,
+            relation_model=relation_model
+        )
+        
+        extractor_init_time = time.time() - extractor_init_start
+        print(f"[PIPELINE] EntityExtractor instance created in {extractor_init_time:.2f}s")
+        logger.info(f"EntityExtractor instance created in {extractor_init_time:.2f}s")
         
         try:
-            # Process all chunks
+            # Process all chunks with detailed timing
+            entity_start_time = time.time()
+            print(f"[PIPELINE] ===== STARTING ENTITY EXTRACTION =====")
+            print(f"[PIPELINE] Starting entity extraction process_chunks at {entity_start_time:.2f}")
+            logger.info(f"Starting entity extraction process_chunks with {len(resolved_chunks)} chunks")
+            
             processed_chunks, entities, relationships = extractor.process_chunks(resolved_chunks)
+            
+            entity_time = time.time() - entity_start_time
+            print(f"[PIPELINE] Entity extraction completed in {entity_time:.2f}s")
+            logger.info(f"Entity extraction completed in {entity_time:.2f}s")
+            print(f"[PIPELINE] ===== ENTITY EXTRACTION COMPLETE =====")
             
             logger.info(f"Extracted {len(entities)} entities and {len(relationships)} relationships")
             status_queue.put(('status', f"Extracted {len(entities)} entities and {len(relationships)} relationships"))
@@ -175,7 +270,7 @@ def process_documents(file_paths: List[str], status_queue: multiprocessing.Queue
             return False
         
         # Step 5: Indexing
-        status_queue.put(('status', "Step 5/5: Indexing"))
+        status_queue.put(('status', "Step 5/6: Indexing"))
         status_queue.put(('progress', 0.8, "Starting indexing"))
         
         # Initialize indexer
@@ -206,6 +301,15 @@ def process_documents(file_paths: List[str], status_queue: multiprocessing.Queue
         status_queue.put(('progress', 1.0, "Processing complete"))
         status_queue.put(('success', "Document processing completed successfully"))
         
+        # Step 6: Cleanup
+        if preload_models and model_manager is not None:
+            status_queue.put(('status', "Step 6/6: Resource Cleanup"))
+            status_queue.put(('progress', 1.0, "Unloading models and freeing resources"))
+            
+            print(f"[PIPELINE] ===== FINAL CLEANUP =====")
+            model_manager.unload_all_models()
+            print(f"[PIPELINE] ===== CLEANUP COMPLETE =====")
+        
         return True
         
     except Exception as e:
@@ -213,6 +317,14 @@ def process_documents(file_paths: List[str], status_queue: multiprocessing.Queue
         logger.error(error_msg)
         logger.error(traceback.format_exc())
         status_queue.put(('error', error_msg))
+        
+        # Make sure to unload models even on error
+        if preload_models and 'model_manager' in locals() and model_manager is not None:
+            try:
+                model_manager.unload_all_models()
+            except Exception as cleanup_error:
+                logger.error(f"Error during cleanup: {cleanup_error}")
+                
         return False
 
 def save_results(entities: List[Dict[str, Any]], relationships: List[Dict[str, Any]]) -> None:
@@ -237,12 +349,13 @@ def save_results(entities: List[Dict[str, Any]], relationships: List[Dict[str, A
     with open(results_dir / "relationships.json", 'w') as f:
         json.dump(relationships, f, indent=2)
 
-def run_processing_pipeline(file_paths: List[str]) -> Tuple[multiprocessing.Process, multiprocessing.Queue]:
+def run_processing_pipeline(file_paths: List[str], preload_models: bool = True) -> Tuple[multiprocessing.Process, multiprocessing.Queue]:
     """
     Run the document processing pipeline in a dedicated subprocess.
     
     Args:
         file_paths (list): List of paths to documents to process
+        preload_models (bool): Whether to preload all models at the start of processing
         
     Returns:
         tuple: (process, status_queue)
@@ -262,7 +375,7 @@ def run_processing_pipeline(file_paths: List[str]) -> Tuple[multiprocessing.Proc
     # Create and start subprocess
     process = multiprocessing.Process(
         target=process_documents,
-        args=(file_paths, status_queue)
+        args=(file_paths, status_queue, preload_models)
     )
     
     # Start the process

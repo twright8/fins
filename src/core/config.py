@@ -26,6 +26,9 @@ DEFAULT_CONFIG = {
         "chunk_size": 512,  # Target chunk size in tokens
         "chunk_overlap": 50,  # Overlap between chunks in tokens
         "ocr_parallel_jobs": max(1, os.cpu_count() - 2),  # Leave 2 cores free
+        "maverick_batch_size": 8,  # Batch size for Maverick coreference resolution
+        "ner_batch_size": 64,      # Batch size for NER with Flair
+        "relation_batch_size": 32, # Batch size for relation extraction with Flair
     },
     
     # Models

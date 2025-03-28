@@ -507,7 +507,19 @@ class Indexer:
             # Always ensure cleanup happens
             if register is not None:
                 self._update_status("Stopping Infinity embedding model")
-                register.stop()
+                try:
+                    # Safely stop the register, handling potential attribute errors
+                    register.stop()
+                except AttributeError as ae:
+                    # Handle known issue with SyncEngineArray.__del__ in infinity_emb
+                    logger.warning(f"Attribute error when stopping infinity embedding model: {ae}")
+                    print(f"[WARNING] Known issue with infinity-embed cleanup: {ae}")
+                    # We'll still try to clean up as much as possible
+                except Exception as e:
+                    # Log other exceptions but continue cleanup
+                    logger.error(f"Error stopping infinity embedding model: {e}")
+                
+                # Delete reference regardless of stop() success
                 del register
                 
                 # Clean up CUDA memory

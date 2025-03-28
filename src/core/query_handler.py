@@ -20,17 +20,61 @@ class QueryHandler:
     Handles user queries by retrieving relevant context and generating responses.
     """
     
-    def __init__(self):
-        """Initialize query handler with retriever and generator."""
-        self.retriever = Retriever()
-        self.generator = Generator()
+    def __init__(self, lazy_init=False, qdrant_only=False):
+        """
+        Initialize query handler with retriever and generator.
+        
+        Args:
+            lazy_init (bool): If True, don't load embedding models on initialization
+            qdrant_only (bool): If True, only initialize Qdrant connection without embedding models
+        """
+        # Track config
+        self.lazy_init = lazy_init
+        self.qdrant_only = qdrant_only
+        # Initialize basic properties
         self.entities_data = None
         self.relationships_data = None
+        self._retriever = None
+        self._generator = None
         
-        # Load entity and relationship data
+        # Load entity and relationship data (this is quick)
         self._load_processed_data()
         
-        logger.info("QueryHandler initialized")
+        # Initialize components based on config
+        if not lazy_init:
+            self._init_retriever()
+            if not qdrant_only:
+                self._init_generator()
+        
+        logger.info(f"QueryHandler initialized with lazy_init={lazy_init}, qdrant_only={qdrant_only}")
+    
+    def _init_retriever(self):
+        """Initialize the retriever (can be expensive)."""
+        if self._retriever is None:
+            logger.info("Initializing retriever")
+            self._retriever = Retriever(lazy_init=self.lazy_init, qdrant_only=self.qdrant_only)
+            logger.info("Retriever initialized")
+    
+    def _init_generator(self):
+        """Initialize the generator (can be expensive)."""
+        if self._generator is None:
+            logger.info("Initializing generator")
+            self._generator = Generator()
+            logger.info("Generator initialized")
+    
+    @property
+    def retriever(self):
+        """Get the retriever, initializing it if necessary."""
+        if self._retriever is None:
+            self._init_retriever()
+        return self._retriever
+    
+    @property
+    def generator(self):
+        """Get the generator, initializing it if necessary."""
+        if self._generator is None:
+            self._init_generator()
+        return self._generator
     
     def _load_processed_data(self):
         """
