@@ -215,42 +215,23 @@ class ModelManager:
             print(f"[MODELS] Using DeepSeek authentication: {use_auth}")
             
             try:
-                # First try with detailed configuration
-                # Pass the DeepSeek API token if available
+                # Use simplified configuration without unnecessary API keys
                 self.embedding_model = HuggingFaceEmbeddings(
                     model_name=self.embedding_model_name,
                     cache_folder=transformers_cache,
                     model_kwargs={
                         "device": device,
-                        "use_auth_token": deepseek_token if use_auth else None,
-                        "api_key": deepseek_token if use_auth else None,  # Try both formats
                     },
                     encode_kwargs={"normalize_embeddings": True},
                 )
-                print(f"[MODELS] Created embedding model with detailed configuration")
-            except TypeError as te:
-                # Fall back to simpler configuration
-                print(f"[MODELS] Detailed configuration failed ({str(te)}), falling back to basic configuration")
-                # If falling back, we might need to pass the token differently or not at all
-                try:
-                    if use_auth:
-                        # Try alternative API key format
-                        self.embedding_model = HuggingFaceEmbeddings(
-                            model_name=self.embedding_model_name,
-                            huggingface_token=deepseek_token,
-                            api_key=deepseek_token,  # Try adding this as well
-                        )
-                    else:
-                        self.embedding_model = HuggingFaceEmbeddings(
-                            model_name=self.embedding_model_name,
-                        )
-                except Exception as e2:
-                    # Last resort fallback
-                    print(f"[MODELS] Secondary configuration failed ({str(e2)}), using minimal configuration")
-                    self.embedding_model = HuggingFaceEmbeddings(
-                        model_name=self.embedding_model_name,
-                    )
-                print(f"[MODELS] Created embedding model with basic configuration")
+                print(f"[MODELS] Created embedding model with clean configuration")
+            except Exception as e:
+                # Fall back to minimal configuration
+                print(f"[MODELS] Detailed configuration failed ({str(e)}), falling back to minimal configuration")
+                self.embedding_model = HuggingFaceEmbeddings(
+                    model_name=self.embedding_model_name,
+                )
+                print(f"[MODELS] Created embedding model with minimal configuration")
             
             model_time = time.time() - model_start
             total_time = time.time() - start_time
@@ -330,24 +311,23 @@ class ModelManager:
             print(f"[MODELS] Creating semantic chunking model instance at {model_start:.2f}")
             
             try:
-                # First try with detailed configuration
+                # Use simplified configuration without unnecessary API keys
                 self.semantic_chunking_model = HuggingFaceEmbeddings(
                     model_name=self.semantic_chunking_model_name,
                     cache_folder=transformers_cache,
                     model_kwargs={
                         "device": device,
-                        "use_auth_token": False,
                     },
                     encode_kwargs={"normalize_embeddings": True},
                 )
-                print(f"[MODELS] Created semantic chunking model with detailed configuration")
-            except TypeError as te:
-                # Fall back to simpler configuration
-                print(f"[MODELS] Detailed configuration failed ({str(te)}), falling back to basic configuration")
+                print(f"[MODELS] Created semantic chunking model with clean configuration")
+            except Exception as e:
+                # Fall back to minimal configuration
+                print(f"[MODELS] Detailed configuration failed ({str(e)}), falling back to minimal configuration")
                 self.semantic_chunking_model = HuggingFaceEmbeddings(
                     model_name=self.semantic_chunking_model_name,
                 )
-                print(f"[MODELS] Created semantic chunking model with basic configuration")
+                print(f"[MODELS] Created semantic chunking model with minimal configuration")
             
             model_time = time.time() - model_start
             total_time = time.time() - start_time

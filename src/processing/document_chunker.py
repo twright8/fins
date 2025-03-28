@@ -7,11 +7,12 @@ import sys
 import os
 from pathlib import Path
 import uuid
-from typing import List, Dict, Any, Union, Optional
+from typing import List, Dict, Any, Union, Optional, Tuple
 import torch
 import re
 import gc
 import time
+import concurrent.futures
 
 # Add parent directory to sys.path to enable imports from project root
 sys.path.append(str(Path(__file__).resolve().parent.parent.parent))
@@ -138,35 +139,34 @@ class DocumentChunker:
             logger.info(f"Creating HuggingFaceEmbeddings instance...")
             
             try:
-                # First try with the more detailed configuration
+                # Use simplified configuration without unnecessary API keys
                 self.embedding_model = HuggingFaceEmbeddings(
                     model_name=self.embedding_model_name,
                     cache_folder=transformers_cache,
                     model_kwargs={
                         "device": device,
-                        "use_auth_token": False,  # Set to True if using private models
                     },
                     encode_kwargs={"normalize_embeddings": True},
                 )
                 model_creation_time = time.time() - model_creation_start
-                print(f"[CHUNKER] Created embedding model with detailed configuration in {model_creation_time:.2f}s")
-                logger.info(f"Created embedding model with detailed configuration in {model_creation_time:.2f}s")
-            except TypeError as te:
-                # Fall back to simpler configuration if the above fails
-                print(f"[WARNING] Detailed configuration failed ({str(te)}), falling back to basic configuration")
-                logger.warning(f"Detailed configuration failed: {te}")
+                print(f"[CHUNKER] Created embedding model with clean configuration in {model_creation_time:.2f}s")
+                logger.info(f"Created embedding model with clean configuration in {model_creation_time:.2f}s")
+            except Exception as e:
+                # Fall back to minimal configuration
+                print(f"[WARNING] Detailed configuration failed ({str(e)}), falling back to minimal configuration")
+                logger.warning(f"Detailed configuration failed: {e}")
                 
                 fallback_start = time.time()
-                print(f"[CHUNKER] Trying fallback configuration at {fallback_start:.2f}...")
-                logger.info(f"Trying fallback configuration...")
+                print(f"[CHUNKER] Using minimal configuration at {fallback_start:.2f}...")
+                logger.info(f"Using minimal configuration...")
                 
                 self.embedding_model = HuggingFaceEmbeddings(
                     model_name=self.embedding_model_name,
                 )
                 
                 fallback_time = time.time() - fallback_start
-                print(f"[CHUNKER] Created embedding model with basic configuration in {fallback_time:.2f}s")
-                logger.info(f"Created embedding model with basic configuration in {fallback_time:.2f}s")
+                print(f"[CHUNKER] Created embedding model with minimal configuration in {fallback_time:.2f}s")
+                logger.info(f"Created embedding model with minimal configuration in {fallback_time:.2f}s")
             
             elapsed_time = time.time() - start_time
             
@@ -253,75 +253,123 @@ class DocumentChunker:
         
         try:
             
-            # Process each content item (page or section)
+            # Helper function to process a single content item
+            def _process_single_content_item(content_item, doc_id, doc_name, doc_type, document_metadata, file_type, i, total_items):
+                try:
+                    item_start = time.time()
+                    
+                    page_num = content_item.get('page_num', None)
+                    text = content_item.get('text', '')
+                    text_size = len(text)
+                    
+                    # Skip empty content
+                    if not text.strip():
+                        logger.info(f"Skipping empty content item {i+1}/{total_items}")
+                        return []
+                    
+                    # Log item details
+                    page_info = f" (page {page_num})" if page_num else ""
+                    logger.info(f"Processing content item {i+1}/{total_items}{page_info}, size: {text_size} chars")
+                    print(f"[CHUNKER] Processing item {i+1}/{total_items}{page_info}, size: {text_size} chars")
+                    
+                    # Generate semantic chunks for this content
+                    chunking_start = time.time()
+                    print(f"[CHUNKER] Starting semantic chunking for item {i+1} at {chunking_start:.2f}...")
+                    logger.info(f"Starting semantic chunking for item {i+1}...")
+                    content_chunks = self._semantic_chunking(text)
+                    chunking_time = time.time() - chunking_start
+                    print(f"[CHUNKER] Semantic chunking for item {i+1} completed in {chunking_time:.2f}s")
+                    logger.info(f"Semantic chunking for item {i+1} completed in {chunking_time:.2f}s")
+                    
+                    # Log chunking details
+                    logger.info(f"Item {i+1} chunked into {len(content_chunks)} chunks in {chunking_time:.2f}s")
+                    print(f"[CHUNKER] Item {i+1} chunked into {len(content_chunks)} chunks in {chunking_time:.2f}s")
+                    
+                    # Create chunk objects with metadata
+                    item_chunks = []
+                    for chunk_idx, chunk_text in enumerate(content_chunks):
+                        chunk_id = str(uuid.uuid4())
+                        
+                        chunk = {
+                            'chunk_id': chunk_id,
+                            'document_id': doc_id,
+                            'file_name': doc_name,
+                            'text': chunk_text,
+                            'page_num': page_num,
+                            'chunk_idx': chunk_idx,
+                            'metadata': {
+                                'document_metadata': document_metadata,
+                                'file_type': file_type,
+                                'chunk_method': 'semantic'
+                            }
+                        }
+                        
+                        item_chunks.append(chunk)
+                    
+                    # Log item complete time
+                    item_time = time.time() - item_start
+                    if item_time > 1.0:
+                        logger.info(f"Content item {i+1} processed in {item_time:.2f}s")
+                        print(f"[CHUNKER] Content item {i+1} processed in {item_time:.2f}s")
+                    
+                    return item_chunks
+                except Exception as e:
+                    logger.error(f"Error processing content item {i+1}: {e}")
+                    print(f"[CHUNKER ERROR] Error processing content item {i+1}: {e}")
+                    return []
+
+            # Process each content item (page or section) in parallel
             content_items = document.get('content', [])
             total_text_size = sum(len(item.get('text', '')) for item in content_items)
             
             logger.info(f"Document has {len(content_items)} content items, total size: {total_text_size} characters")
             print(f"[CHUNKER] Document has {len(content_items)} items with {total_text_size} characters total")
             
-            total_chunks_created = 0
+            # Get number of workers from config
+            num_workers = CONFIG["document_processing"]["parallelism_workers"]["chunker_pages"]
+            print(f"[CHUNKER] Processing {len(content_items)} content items with {num_workers} workers")
+            logger.info(f"Processing {len(content_items)} content items with {num_workers} workers")
             
+            # Prepare arguments for parallel processing
+            process_args = []
             for i, content_item in enumerate(content_items):
-                item_start = time.time()
-                progress = ((i + 1) / len(content_items)) * 0.9  # Progress up to 90%
-                
-                page_num = content_item.get('page_num', None)
-                text = content_item.get('text', '')
-                text_size = len(text)
-                
-                # Skip empty content
-                if not text.strip():
-                    logger.info(f"Skipping empty content item {i+1}/{len(content_items)}")
+                # Skip empty content items before submitting to ThreadPool
+                if not content_item.get('text', '').strip():
                     continue
-                
-                # Log item details
-                page_info = f" (page {page_num})" if page_num else ""
-                logger.info(f"Processing content item {i+1}/{len(content_items)}{page_info}, size: {text_size} chars")
-                print(f"[CHUNKER] Processing item {i+1}/{len(content_items)}{page_info}, size: {text_size} chars")
-                
-                # Generate semantic chunks for this content
-                self._update_status(f"Chunking content item {i+1}/{len(content_items)}{page_info}", progress)
-                
-                chunking_start = time.time()
-                print(f"[CHUNKER] Starting semantic chunking for item {i+1} at {chunking_start:.2f}...")
-                logger.info(f"Starting semantic chunking for item {i+1}...")
-                content_chunks = self._semantic_chunking(text)
-                chunking_time = time.time() - chunking_start
-                print(f"[CHUNKER] Semantic chunking for item {i+1} completed in {chunking_time:.2f}s")
-                logger.info(f"Semantic chunking for item {i+1} completed in {chunking_time:.2f}s")
-                
-                # Log chunking details
-                logger.info(f"Item {i+1} chunked into {len(content_chunks)} chunks in {chunking_time:.2f}s")
-                print(f"[CHUNKER] Item {i+1} chunked into {len(content_chunks)} chunks in {chunking_time:.2f}s")
-                
-                # Create chunk objects with metadata
-                for chunk_idx, chunk_text in enumerate(content_chunks):
-                    chunk_id = str(uuid.uuid4())
                     
-                    chunk = {
-                        'chunk_id': chunk_id,
-                        'document_id': document.get('document_id', ''),
-                        'file_name': document.get('file_name', ''),
-                        'text': chunk_text,
-                        'page_num': page_num,
-                        'chunk_idx': chunk_idx,
-                        'metadata': {
-                            'document_metadata': document.get('metadata', {}),
-                            'file_type': document.get('file_type', ''),
-                            'chunk_method': 'semantic'
-                        }
-                    }
-                    
-                    chunks.append(chunk)
+                process_args.append((
+                    content_item,
+                    document.get('document_id', 'unknown'),
+                    document.get('file_name', 'unknown'),
+                    document.get('file_type', 'unknown'),
+                    document.get('metadata', {}),
+                    document.get('file_type', ''),
+                    i,
+                    len(content_items)
+                ))
+            
+            # Use ThreadPoolExecutor to process content items in parallel
+            processed_count = 0
+            with concurrent.futures.ThreadPoolExecutor(max_workers=num_workers) as executor:
+                # Submit all tasks
+                future_to_idx = {executor.submit(_process_single_content_item, *args): i 
+                                for i, args in enumerate(process_args)}
                 
-                total_chunks_created += len(content_chunks)
-                
-                # Log item complete time
-                item_time = time.time() - item_start
-                if item_time > 1.0:
-                    logger.info(f"Content item {i+1} processed in {item_time:.2f}s")
-                    print(f"[CHUNKER] Content item {i+1} processed in {item_time:.2f}s")
+                # Collect results as they complete
+                for future in concurrent.futures.as_completed(future_to_idx):
+                    idx = future_to_idx[future]
+                    try:
+                        item_chunks = future.result()
+                        chunks.extend(item_chunks)
+                        
+                        # Update progress
+                        processed_count += 1
+                        progress = (processed_count / len(process_args)) * 0.9  # Progress up to 90%
+                        self._update_status(f"Chunked {processed_count}/{len(process_args)} content items", progress)
+                        
+                    except Exception as e:
+                        logger.error(f"Error in content item task {idx}: {e}")
+                        print(f"[CHUNKER ERROR] Error in content item task {idx}: {e}")
             
             # End of chunking
             total_time = time.time() - start_time

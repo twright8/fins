@@ -10,6 +10,7 @@ import gc
 from typing import List, Dict, Any, Tuple
 import logging
 import uuid
+import concurrent.futures
 
 # Add parent directory to sys.path to enable imports from project root
 sys.path.append(str(Path(__file__).resolve().parent.parent.parent))
@@ -476,6 +477,26 @@ class Indexer:
                     print(f"[DEBUG] Vector sample: {str(embedding)[:100] if hasattr(embedding, '__str__') else 'Cannot display'}")
                     raise
             
+            # Helper function to upsert a batch of points
+            def _upsert_batch_to_qdrant(client, collection_name, points_batch, batch_num, total_batches):
+                try:
+                    batch_start = time.time()
+                    print(f"[INDEXER] Upserting batch {batch_num}/{total_batches} with {len(points_batch)} points")
+                    
+                    client.upsert(
+                        collection_name=collection_name,
+                        points=points_batch,
+                        wait=True
+                    )
+                    
+                    batch_time = time.time() - batch_start
+                    print(f"[INDEXER] Batch {batch_num}/{total_batches} upserted in {batch_time:.2f}s")
+                    return len(points_batch), batch_time
+                except Exception as e:
+                    print(f"[ERROR] Failed to upsert batch {batch_num}: {e}")
+                    logger.error(f"Failed to upsert batch {batch_num}: {e}")
+                    return 0, 0
+            
             # Check if we have any valid points
             if not points:
                 error_msg = "No valid embeddings were generated. Vector indexing failed."
@@ -489,13 +510,46 @@ class Indexer:
                 logger.warning(f"Skipped {skipped_count} out of {len(embeddings)} points due to invalid embeddings")
                 print(f"[WARNING] Skipped {skipped_count} points due to invalid embeddings")
             
-            # Upsert points to Qdrant
-            self._update_status(f"Upserting {len(points)} points to Qdrant", 0.95)
-            client.upsert(
-                collection_name=self.qdrant_collection,
-                points=points,
-                wait=True
-            )
+            # Get number of workers from config
+            num_workers = CONFIG["document_processing"]["parallelism_workers"]["qdrant_upsert_batches"]
+            
+            # Decide on batch size - use a reasonable size for Qdrant batches
+            total_points = len(points)
+            batch_size = 100  # Default batch size
+            num_batches = (total_points + batch_size - 1) // batch_size
+            
+            self._update_status(f"Upserting {total_points} points to Qdrant in {num_batches} batches using {num_workers} workers", 0.95)
+            print(f"[INDEXER] Upserting {total_points} points to Qdrant in {num_batches} batches using {num_workers} workers")
+            
+            # Prepare batches
+            point_batches = []
+            for i in range(0, total_points, batch_size):
+                batch = points[i:i+batch_size]
+                point_batches.append((batch, i//batch_size + 1, num_batches))
+            
+            # Upsert batches in parallel
+            total_upserted = 0
+            with concurrent.futures.ThreadPoolExecutor(max_workers=num_workers) as executor:
+                # Submit all upsert tasks
+                future_to_batch = {
+                    executor.submit(_upsert_batch_to_qdrant, client, self.qdrant_collection, batch, batch_num, num_batches): batch_num 
+                    for batch, batch_num, num_batches in point_batches
+                }
+                
+                # Process results as they complete
+                for future in concurrent.futures.as_completed(future_to_batch):
+                    batch_num = future_to_batch[future]
+                    try:
+                        points_upserted, batch_time = future.result()
+                        total_upserted += points_upserted
+                        
+                        # Update progress
+                        progress = 0.95 + (0.05 * (batch_num / num_batches))
+                        self._update_status(f"Upserted batch {batch_num}/{num_batches} ({total_upserted}/{total_points} points total)", progress)
+                        
+                    except Exception as e:
+                        logger.error(f"Error in upsert batch {batch_num}: {e}")
+                        print(f"[ERROR] Error in upsert batch {batch_num}: {e}")
             
             self._update_status(f"Vector indexing complete: added {len(points)} vectors to collection '{self.qdrant_collection}'", 1.0)
             return True

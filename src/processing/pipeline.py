@@ -7,6 +7,7 @@ import os
 from pathlib import Path
 import time
 import multiprocessing
+import concurrent.futures
 from typing import List, Dict, Any, Tuple, Optional
 import traceback
 
@@ -109,25 +110,42 @@ def process_documents(file_paths: List[str], status_queue: multiprocessing.Queue
         # Initialize document loader
         loader = DocumentLoader(status_queue=status_queue)
         
-        # Process each document
-        documents = []
-        for i, file_path in enumerate(file_paths):
+        # Helper function to load a single document
+        def _load_single_document(loader_instance, fp):
             try:
-                # Load document
-                document = loader.load_document(file_path)
-                documents.append(document)
-                
-                # Update progress - document loading takes 15% of total progress
-                progress_per_doc = 0.15 / len(file_paths)
-                progress = base_progress + (i + 1) * progress_per_doc
-                status_queue.put(('progress', progress, f"Loaded {i+1}/{len(file_paths)} documents"))
-                
+                return loader_instance.load_document(fp)
             except Exception as e:
-                error_msg = f"Error loading document {file_path}: {str(e)}"
-                logger.error(error_msg)
-                logger.error(traceback.format_exc())
-                status_queue.put(('error', error_msg))
-                return False
+                logger.error(f"Failed to load {fp}: {e}")
+                # Raise to allow collection loop to catch it
+                raise
+        
+        # Process documents in parallel
+        documents = []
+        num_workers = CONFIG["document_processing"]["parallelism_workers"]["document_loading"]
+        logger.info(f"Loading {len(file_paths)} documents using {num_workers} workers...")
+        
+        with concurrent.futures.ThreadPoolExecutor(max_workers=num_workers) as executor:
+            future_to_path = {executor.submit(_load_single_document, loader, fp): fp for fp in file_paths}
+            processed_count = 0
+            
+            for future in concurrent.futures.as_completed(future_to_path):
+                path = future_to_path[future]
+                try:
+                    document = future.result()
+                    if document:
+                        documents.append(document)
+                    processed_count += 1
+                    
+                    # Update progress - document loading takes 15% of total progress
+                    progress = base_progress + (processed_count / len(file_paths)) * 0.15
+                    status_queue.put(('progress', progress, f"Loaded {processed_count}/{len(file_paths)} documents"))
+                    
+                except Exception as e:
+                    error_msg = f"Error loading document {path}: {str(e)}"
+                    logger.error(error_msg)
+                    logger.error(traceback.format_exc())
+                    status_queue.put(('error', error_msg))
+                    return False
         
         logger.info(f"Loaded {len(documents)} documents")
         status_queue.put(('status', f"Successfully loaded {len(documents)} documents"))

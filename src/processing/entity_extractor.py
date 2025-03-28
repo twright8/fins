@@ -9,6 +9,7 @@ import gc
 from typing import List, Dict, Any, Tuple, Set
 import uuid
 import time
+import concurrent.futures
 
 # Add parent directory to sys.path to enable imports from project root
 sys.path.append(str(Path(__file__).resolve().parent.parent.parent))
@@ -299,41 +300,77 @@ class EntityExtractor:
             
             empty_chunk_ids = set()  # Track empty chunks
             
-            # First loop: Collect all sentences from all chunks
-            split_start_time = time.time()
-            for chunk in chunks:
+            # Helper function to split a chunk text into sentences
+            def _split_chunk_text_nltk(chunk, empty_chunk_ids_set, idx, total_chunks):
                 chunk_id = chunk.get('chunk_id')
                 document_id = chunk.get('document_id')
                 text = chunk.get('text', '')
                 
                 if not text.strip():
                     # Skip empty chunks but track them
-                    empty_chunk_ids.add(chunk_id)
-                    continue
+                    return chunk_id, [], []
                 
                 # Split chunk into sentences
                 try:
                     split_start = time.time()
-                    print(f"[ENTITY] Splitting chunk {chunk_id} at {split_start:.2f}")
+                    print(f"[ENTITY] Splitting chunk {chunk_id} ({idx+1}/{total_chunks}) at {split_start:.2f}")
                     
                     # Use NLTK's sent_tokenize instead of Flair's splitter
                     sentences_text = nltk.sent_tokenize(text)
                     
                     # Convert sentence strings to Flair Sentence objects
-                    all_sentences_flair = []
+                    result_sentences = []
+                    result_mappings = []
+                    
                     for sent_text in sentences_text:
                         if sent_text.strip():
                             flair_sentence = Sentence(sent_text)
-                            current_idx = len(all_sentences)
-                            all_sentences.append(flair_sentence)
-                            sentence_to_chunk_map.append((current_idx, chunk_id, document_id))
+                            result_sentences.append(flair_sentence)
+                            result_mappings.append((chunk_id, document_id))
                     
                     print(f"[ENTITY] Split chunk {chunk_id} into {len(sentences_text)} sentences in {time.time() - split_start:.4f}s")
+                    return chunk_id, result_sentences, result_mappings
                         
                 except Exception as e:
                     logger.error(f"Error splitting chunk {chunk_id}: {e}")
-                    # Skip problematic chunks
-                    empty_chunk_ids.add(chunk_id)
+                    return chunk_id, [], []
+            
+            # Get number of workers from config for sentence splitting
+            num_workers = CONFIG["document_processing"]["parallelism_workers"]["entity_splitting"]
+            logger.info(f"Splitting {len(chunks)} chunks into sentences using {num_workers} workers")
+            print(f"[ENTITY] Splitting {len(chunks)} chunks into sentences using {num_workers} workers")
+            
+            # Process chunks in parallel using ThreadPoolExecutor
+            split_start_time = time.time()
+            
+            with concurrent.futures.ThreadPoolExecutor(max_workers=num_workers) as executor:
+                # Submit all chunk splitting tasks
+                future_to_idx = {
+                    executor.submit(_split_chunk_text_nltk, chunk, empty_chunk_ids, i, len(chunks)): i 
+                    for i, chunk in enumerate(chunks) if chunk.get('text', '').strip()
+                }
+                
+                # Process results as they complete
+                completed = 0
+                for future in concurrent.futures.as_completed(future_to_idx):
+                    chunk_id, chunk_sentences, chunk_mappings = future.result()
+                    
+                    if not chunk_sentences:
+                        empty_chunk_ids.add(chunk_id)
+                    else:
+                        # Add sentences to the main list
+                        start_idx = len(all_sentences)
+                        all_sentences.extend(chunk_sentences)
+                        
+                        # Create mapping entries with correct indices
+                        for i, (c_id, doc_id) in enumerate(chunk_mappings):
+                            sentence_to_chunk_map.append((start_idx + i, c_id, doc_id))
+                    
+                    # Update progress
+                    completed += 1
+                    if completed % 10 == 0 or completed == len(future_to_idx):
+                        progress = 0.1 + (0.2 * (completed / len(future_to_idx)))
+                        self._update_status(f"Split {completed}/{len(future_to_idx)} chunks into sentences", progress)
             
             split_time = time.time() - split_start_time
             logger.info(f"Split {len(chunks)} chunks into {len(all_sentences)} sentences in {split_time:.2f}s")

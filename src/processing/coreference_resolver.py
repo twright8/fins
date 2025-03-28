@@ -7,7 +7,8 @@ import re
 from pathlib import Path
 import torch
 import gc
-from typing import List, Dict, Any
+import concurrent.futures
+from typing import List, Dict, Any, Tuple
 
 # Add parent directory to sys.path to enable imports from project root
 sys.path.append(str(Path(__file__).resolve().parent.parent.parent))
@@ -281,22 +282,10 @@ class CoreferenceResolver:
                 logger.info("Using pre-loaded FastCoref model")
                 print(f"[COREF] Using pre-loaded FastCoref model")
             
-            # Create a map to store resolved texts
-            all_resolved_texts = {}
-            num_batches = (len(chunks) + batch_size - 1) // batch_size
-            
-            # Performance tracking
-            total_text_len = sum(len(chunk.get('text', '')) for chunk in chunks)
-            total_tokens = 0
-            batch_times = []
-            
-            # Process chunks in batches
-            for i in range(0, len(chunks), batch_size):
+            # Helper function to process a single batch of chunks
+            def _process_coref_batch(batch_chunks, batch_num, total_batches):
                 batch_start = time.time()
-                current_batch_num = (i // batch_size) + 1
-                
-                # Get current batch of chunks
-                batch_chunks = chunks[i:i + batch_size]
+                batch_results = {}
                 
                 # Extract texts and chunk IDs
                 batch_texts_raw = [chunk.get('text', '') for chunk in batch_chunks]
@@ -309,25 +298,20 @@ class CoreferenceResolver:
                 
                 # Handle empty batches
                 if not batch_texts_valid:
-                    logger.warning(f"Skipping empty batch {current_batch_num}/{num_batches}")
+                    logger.warning(f"Skipping empty batch {batch_num}/{total_batches}")
                     for chunk in batch_chunks:  # Ensure all chunks are included in the results
-                        all_resolved_texts[chunk.get('chunk_id')] = chunk.get('text', '')
-                    continue
-                
-                # Update progress
-                progress = (i + len(batch_chunks)) / len(chunks)
-                self._update_status(f"Applying coreference resolution: batch {current_batch_num}/{num_batches}", progress)
+                        batch_results[chunk.get('chunk_id')] = chunk.get('text', '')
+                    return batch_results, 0, 0
                 
                 # Log batch information
                 tokens_in_batch = sum(len(text.split()) for text in batch_texts_valid)
-                total_tokens += tokens_in_batch
-                logger.info(f"Processing batch {current_batch_num}/{num_batches} with {len(batch_texts_valid)} valid chunks (~{tokens_in_batch} tokens)")
+                logger.info(f"Processing batch {batch_num}/{total_batches} with {len(batch_texts_valid)} valid chunks (~{tokens_in_batch} tokens)")
                 
                 try:
                     # Process the batch with FastCoref
                     batch_resolution_start = time.time()
-                    print(f"[COREF] Starting prediction for batch {current_batch_num} at {batch_resolution_start:.2f}...")
-                    logger.info(f"Starting prediction for batch {current_batch_num} with {len(batch_texts_valid)} texts...")
+                    print(f"[COREF] Starting prediction for batch {batch_num} at {batch_resolution_start:.2f}...")
+                    logger.info(f"Starting prediction for batch {batch_num} with {len(batch_texts_valid)} texts...")
                     
                     # Get predictions for the current batch
                     prediction_start = time.time()
@@ -351,7 +335,7 @@ class CoreferenceResolver:
                         resolved_text = self.replace_coreferences_fastcoref(original_text, clusters)
                         
                         # Store the result
-                        all_resolved_texts[chunk_id] = resolved_text
+                        batch_results[chunk_id] = resolved_text
                     
                     processing_time = time.time() - processing_start
                     batch_resolution_time = time.time() - batch_resolution_start
@@ -363,22 +347,74 @@ class CoreferenceResolver:
                     # Make sure any skipped chunks (empty or invalid) are included with original text
                     for idx, chunk in enumerate(batch_chunks):
                         chunk_id = chunk.get('chunk_id')
-                        if chunk_id not in all_resolved_texts:
-                            all_resolved_texts[chunk_id] = chunk.get('text', '')
+                        if chunk_id not in batch_results:
+                            batch_results[chunk_id] = chunk.get('text', '')
+                    
+                    batch_time = time.time() - batch_start
+                    return batch_results, batch_time, tokens_in_batch
                     
                 except Exception as e:
-                    logger.error(f"Error processing batch {current_batch_num}: {e}")
+                    logger.error(f"Error processing batch {batch_num}: {e}")
                     import traceback
                     logger.error(traceback.format_exc())
                     
                     # For any failed batch, use original texts
                     for chunk in batch_chunks:
-                        all_resolved_texts[chunk.get('chunk_id')] = chunk.get('text', '')
+                        batch_results[chunk.get('chunk_id')] = chunk.get('text', '')
+                    
+                    batch_time = time.time() - batch_start
+                    return batch_results, batch_time, 0
+            
+            # Create a map to store resolved texts
+            all_resolved_texts = {}
+            num_batches = (len(chunks) + batch_size - 1) // batch_size
+            
+            # Performance tracking
+            total_text_len = sum(len(chunk.get('text', '')) for chunk in chunks)
+            total_tokens = 0
+            batch_times = []
+            
+            # Get number of workers from config
+            num_workers = CONFIG["document_processing"]["parallelism_workers"]["coref_batches"]
+            logger.info(f"Processing {num_batches} coref batches with {num_workers} workers")
+            print(f"[COREF] Processing {num_batches} coref batches with {num_workers} workers")
+            
+            # Prepare batches and their arguments
+            batch_args = []
+            for i in range(0, len(chunks), batch_size):
+                batch_chunks = chunks[i:i + batch_size]
+                current_batch_num = (i // batch_size) + 1
+                batch_args.append((batch_chunks, current_batch_num, num_batches))
+            
+            # Process batches in parallel using ThreadPoolExecutor
+            completed_batches = 0
+            with concurrent.futures.ThreadPoolExecutor(max_workers=num_workers) as executor:
+                # Submit all batch tasks
+                future_to_batch_num = {executor.submit(_process_coref_batch, *args): args[1] for args in batch_args}
                 
-                batch_time = time.time() - batch_start
-                batch_times.append(batch_time)
-                logger.info(f"Batch {current_batch_num}/{num_batches} completed in {batch_time:.2f}s")
-                print(f"[COREF] Batch {current_batch_num}/{num_batches} completed in {batch_time:.2f}s")
+                # Collect results as they complete
+                for future in concurrent.futures.as_completed(future_to_batch_num):
+                    batch_num = future_to_batch_num[future]
+                    try:
+                        batch_results, batch_time, tokens_in_batch = future.result()
+                        
+                        # Update global tracking variables
+                        all_resolved_texts.update(batch_results)
+                        if batch_time > 0:
+                            batch_times.append(batch_time)
+                        total_tokens += tokens_in_batch
+                        
+                        # Update progress
+                        completed_batches += 1
+                        progress = completed_batches / num_batches
+                        self._update_status(f"Applying coreference resolution: batch {batch_num}/{num_batches} complete", progress)
+                        
+                        logger.info(f"Batch {batch_num}/{num_batches} completed in {batch_time:.2f}s")
+                        print(f"[COREF] Batch {batch_num}/{num_batches} completed in {batch_time:.2f}s")
+                        
+                    except Exception as e:
+                        logger.error(f"Error in batch {batch_num}: {e}")
+                        print(f"[COREF ERROR] Error in batch {batch_num}: {e}")
             
             # Create processed chunks using the resolved texts
             processed_chunks = []
