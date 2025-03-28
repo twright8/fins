@@ -5,6 +5,10 @@ Contains all configurable parameters for the system.
 import os
 import yaml
 from pathlib import Path
+from dotenv import load_dotenv
+
+# Load environment variables from .env file
+load_dotenv()
 
 # Base paths
 PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent
@@ -108,6 +112,7 @@ DEFAULT_CONFIG = {
 def load_config():
     """
     Load configuration from YAML file, or create default if not exists.
+    Then override with environment variables where appropriate.
     
     Returns:
         dict: Configuration dictionary
@@ -123,6 +128,26 @@ def load_config():
                         merged_config[section].update(values)
                     else:
                         merged_config[section] = values
+                
+                # Override with environment variables if they exist
+                # Check for DeepSeek API key
+                deepseek_api_key = os.environ.get('DEEPSEEK_API_KEY')
+                if deepseek_api_key:
+                    print(f"Found DeepSeek API key in environment variables")
+                    merged_config['generation']['deepseek']['api_key'] = deepseek_api_key
+                    
+                    # If DeepSeek API key is provided, we should probably use DeepSeek as provider
+                    if merged_config['generation']['deepseek']['api_key']:
+                        merged_config['generation']['provider'] = 'deepseek'
+                        print(f"Automatically switching provider to DeepSeek since API key is available")
+                
+                # Check for provider override
+                provider_override = os.environ.get('PROVIDER')
+                if provider_override:
+                    if provider_override.lower() in ['deepseek', 'aphrodite']:
+                        print(f"Overriding provider with {provider_override} from environment variables")
+                        merged_config['generation']['provider'] = provider_override.lower()
+                
                 return merged_config
         except Exception as e:
             print(f"Error loading config: {e}. Using defaults.")

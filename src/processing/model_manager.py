@@ -10,6 +10,7 @@ import time
 import torch
 import gc
 from typing import Dict, Any, Optional
+from dotenv import load_dotenv
 
 # Add parent directory to sys.path to enable imports from project root
 sys.path.append(str(Path(__file__).resolve().parent.parent.parent))
@@ -49,12 +50,14 @@ class ModelManager:
         
         # Initialize model holders
         self.embedding_model = None
+        self.semantic_chunking_model = None
         self.flair_ner_model = None
         self.flair_relation_model = None
         self.coref_model = None
         
         # Set model names from config
         self.embedding_model_name = CONFIG["models"]["embedding_model"]
+        self.semantic_chunking_model_name = CONFIG["models"].get("semantic_chunking_model", self.embedding_model_name)
         self.ner_model_name = CONFIG["models"]["ner_model"]
         
         # Configure cache directories
@@ -70,7 +73,11 @@ class ModelManager:
         log_memory_usage(logger)
     
     def _configure_cache_directories(self):
-        """Configure cache directories for all model libraries"""
+        """Configure cache directories and load environment variables for all model libraries"""
+        # Load environment variables from .env file if it exists
+        env_file = os.path.join(Path(__file__).resolve().parent.parent.parent, '.env')
+        load_dotenv(env_file)
+        
         # Set up consistent cache directories
         cache_root = os.path.expanduser('~/.cache')
         
@@ -82,6 +89,15 @@ class ModelManager:
         
         # Flair cache
         os.environ["FLAIR_CACHE_ROOT"] = os.path.join(cache_root, 'flair')
+        
+        # Check for DeepSeek API key in environment
+        deepseek_token = os.environ.get('DEEPSEEK_API_KEY')
+        if deepseek_token:
+            logger.info("DeepSeek API token found in environment")
+            print(f"[MODELS] DeepSeek API token found in environment")
+        else:
+            logger.info("No DeepSeek API token found in environment, using anonymous access")
+            print(f"[MODELS] No DeepSeek API token found in environment, using anonymous access")
         
         # Log cache locations
         logger.info(f"Cache directories configured:")
@@ -121,18 +137,21 @@ class ModelManager:
         self._update_status("Loading all models for processing pipeline")
         
         start_time = time.time()
-        
-        # 1. Load embedding model (for semantic chunking)
+        # 3. Load Flair NER model
+        self.load_flair_ner_model()
+
+        # 4. Load Flair relation model
+        self.load_flair_relation_model()
+        # 1. Load embedding model (for indexing/retrieval)
         self.load_embedding_model()
+        
+        # 2. Load semantic chunking model (might be the same as embedding model)
+        self.load_semantic_chunking_model()
         
         # 2. Load coreference model
         self.load_coref_model()
         
-        # 3. Load Flair NER model
-        self.load_flair_ner_model()
-        
-        # 4. Load Flair relation model
-        self.load_flair_relation_model()
+
         
         total_time = time.time() - start_time
         
@@ -144,15 +163,17 @@ class ModelManager:
     
     def load_embedding_model(self):
         """
-        Load embedding model for semantic chunking.
+        Load embedding model for retrieval/indexing.
         """
         if self.embedding_model is not None:
             logger.info("Embedding model already loaded")
             print(f"[MODELS] Embedding model already loaded")
+            self._update_status("Embedding model already loaded")
             return
         
         print(f"[MODELS] ===== LOADING EMBEDDING MODEL =====")
         logger.info(f"===== LOADING EMBEDDING MODEL =====")
+        self._update_status("Loading embedding model...")
         
         start_time = time.time()
         
@@ -180,22 +201,29 @@ class ModelManager:
             else:
                 print(f"[MODELS] CUDA is not available - using CPU")
             
+            # Check for DeepSeek API token
+            deepseek_token = os.environ.get('DEEPSEEK_API_KEY')
+            use_auth = bool(deepseek_token)
+            
             # Key optimization: preload import time
             import_start = time.time()
-            print(f"[MODELS] Preparing HuggingFace libraries at {import_start:.2f}")
+            print(f"[MODELS] Preparing embedding libraries at {import_start:.2f}")
             
             # Actual model creation
             model_start = time.time()
-            print(f"[MODELS] Creating HuggingFaceEmbeddings instance at {model_start:.2f}")
+            print(f"[MODELS] Creating embedding model instance at {model_start:.2f}")
+            print(f"[MODELS] Using DeepSeek authentication: {use_auth}")
             
             try:
                 # First try with detailed configuration
+                # Pass the DeepSeek API token if available
                 self.embedding_model = HuggingFaceEmbeddings(
                     model_name=self.embedding_model_name,
                     cache_folder=transformers_cache,
                     model_kwargs={
                         "device": device,
-                        "use_auth_token": False,
+                        "use_auth_token": deepseek_token if use_auth else None,
+                        "api_key": deepseek_token if use_auth else None,  # Try both formats
                     },
                     encode_kwargs={"normalize_embeddings": True},
                 )
@@ -203,9 +231,25 @@ class ModelManager:
             except TypeError as te:
                 # Fall back to simpler configuration
                 print(f"[MODELS] Detailed configuration failed ({str(te)}), falling back to basic configuration")
-                self.embedding_model = HuggingFaceEmbeddings(
-                    model_name=self.embedding_model_name,
-                )
+                # If falling back, we might need to pass the token differently or not at all
+                try:
+                    if use_auth:
+                        # Try alternative API key format
+                        self.embedding_model = HuggingFaceEmbeddings(
+                            model_name=self.embedding_model_name,
+                            huggingface_token=deepseek_token,
+                            api_key=deepseek_token,  # Try adding this as well
+                        )
+                    else:
+                        self.embedding_model = HuggingFaceEmbeddings(
+                            model_name=self.embedding_model_name,
+                        )
+                except Exception as e2:
+                    # Last resort fallback
+                    print(f"[MODELS] Secondary configuration failed ({str(e2)}), using minimal configuration")
+                    self.embedding_model = HuggingFaceEmbeddings(
+                        model_name=self.embedding_model_name,
+                    )
                 print(f"[MODELS] Created embedding model with basic configuration")
             
             model_time = time.time() - model_start
@@ -232,6 +276,103 @@ class ModelManager:
             traceback.print_exc()
             raise
     
+    def load_semantic_chunking_model(self):
+        """
+        Load embedding model for semantic chunking.
+        """
+        # Skip loading if same as main embedding model and that's already loaded
+        if self.semantic_chunking_model_name == self.embedding_model_name and self.embedding_model is not None:
+            logger.info("Using main embedding model for semantic chunking (same model)")
+            print(f"[MODELS] Using main embedding model for semantic chunking (same model)")
+            self.semantic_chunking_model = self.embedding_model
+            return
+            
+        if self.semantic_chunking_model is not None:
+            logger.info("Semantic chunking model already loaded")
+            print(f"[MODELS] Semantic chunking model already loaded")
+            return
+        
+        print(f"[MODELS] ===== LOADING SEMANTIC CHUNKING MODEL =====")
+        logger.info(f"===== LOADING SEMANTIC CHUNKING MODEL =====")
+        
+        start_time = time.time()
+        
+        try:
+            from langchain_huggingface import HuggingFaceEmbeddings
+            import torch
+            from transformers import logging as transformers_logging
+            
+            # Set transformers logging level
+            transformers_logging.set_verbosity_info()
+            
+            # Print caching info
+            hf_cache = os.environ.get('HF_HOME')
+            transformers_cache = os.environ.get('TRANSFORMERS_CACHE')
+            
+            print(f"[MODELS] Loading semantic chunking model: {self.semantic_chunking_model_name}")
+            print(f"[MODELS] Using HuggingFace cache: {hf_cache}")
+            print(f"[MODELS] Using Transformers cache: {transformers_cache}")
+            
+            # Configure PyTorch to use GPU if available
+            device = "cuda" if torch.cuda.is_available() else "cpu"
+            
+            if torch.cuda.is_available():
+                print(f"[MODELS] CUDA is available - using device: {torch.cuda.get_device_name(0)}")
+            else:
+                print(f"[MODELS] CUDA is not available - using CPU")
+            
+            # Key optimization: preload import time
+            import_start = time.time()
+            print(f"[MODELS] Preparing HuggingFace libraries at {import_start:.2f}")
+            
+            # Actual model creation
+            model_start = time.time()
+            print(f"[MODELS] Creating semantic chunking model instance at {model_start:.2f}")
+            
+            try:
+                # First try with detailed configuration
+                self.semantic_chunking_model = HuggingFaceEmbeddings(
+                    model_name=self.semantic_chunking_model_name,
+                    cache_folder=transformers_cache,
+                    model_kwargs={
+                        "device": device,
+                        "use_auth_token": False,
+                    },
+                    encode_kwargs={"normalize_embeddings": True},
+                )
+                print(f"[MODELS] Created semantic chunking model with detailed configuration")
+            except TypeError as te:
+                # Fall back to simpler configuration
+                print(f"[MODELS] Detailed configuration failed ({str(te)}), falling back to basic configuration")
+                self.semantic_chunking_model = HuggingFaceEmbeddings(
+                    model_name=self.semantic_chunking_model_name,
+                )
+                print(f"[MODELS] Created semantic chunking model with basic configuration")
+            
+            model_time = time.time() - model_start
+            total_time = time.time() - start_time
+            
+            # Warm up the model with a test encoding to make sure everything is loaded
+            warmup_start = time.time()
+            print(f"[MODELS] Warming up semantic chunking model with test encoding")
+            _ = self.semantic_chunking_model.embed_query("This is a test sentence.")
+            warmup_time = time.time() - warmup_start
+            
+            print(f"[MODELS] Semantic chunking model creation: {model_time:.2f}s")
+            print(f"[MODELS] Semantic chunking model warmup: {warmup_time:.2f}s")
+            print(f"[MODELS] Total semantic chunking model loading: {total_time:.2f}s")
+            
+            logger.info(f"Semantic chunking model loaded in {total_time:.2f}s")
+            
+        except Exception as e:
+            error_msg = f"Error loading semantic chunking model: {e}"
+            self._update_status(error_msg)
+            logger.error(error_msg)
+            print(f"[MODELS ERROR] {error_msg}")
+            import traceback
+            traceback.print_exc()
+            raise
+            
     def load_coref_model(self):
         """
         Load FastCoref model for coreference resolution.
@@ -239,10 +380,12 @@ class ModelManager:
         if self.coref_model is not None:
             logger.info("FastCoref model already loaded")
             print(f"[MODELS] FastCoref model already loaded")
+            self._update_status("FastCoref model already loaded")
             return
         
         print(f"[MODELS] ===== LOADING COREFERENCE MODEL =====")
         logger.info(f"===== LOADING COREFERENCE MODEL =====")
+        self._update_status("Loading FastCoref model...")
         
         start_time = time.time()
         
@@ -298,10 +441,12 @@ class ModelManager:
         if self.flair_ner_model is not None:
             logger.info("Flair NER model already loaded")
             print(f"[MODELS] Flair NER model already loaded")
+            self._update_status("Flair NER model already loaded")
             return
         
         print(f"[MODELS] ===== LOADING FLAIR NER MODEL =====")
         logger.info(f"===== LOADING FLAIR NER MODEL =====")
+        self._update_status("Loading Flair NER model...")
         
         start_time = time.time()
         
@@ -357,10 +502,12 @@ class ModelManager:
         if self.flair_relation_model is not None:
             logger.info("Flair relation model already loaded")
             print(f"[MODELS] Flair relation model already loaded")
+            self._update_status("Flair relation model already loaded")
             return
         
         print(f"[MODELS] ===== LOADING FLAIR RELATION MODEL =====")
         logger.info(f"===== LOADING FLAIR RELATION MODEL =====")
+        self._update_status("Loading Flair relation model...")
         
         start_time = time.time()
         
@@ -456,6 +603,7 @@ class ModelManager:
         """
         return {
             "embedding_model": self.embedding_model,
+            "semantic_chunking_model": self.semantic_chunking_model,
             "flair_ner_model": self.flair_ner_model,
             "flair_relation_model": self.flair_relation_model,
             "coref_model": self.coref_model

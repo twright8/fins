@@ -344,7 +344,9 @@ class Indexer:
                     print(f"[INFO] Attempting fallback: processing in smaller batches")
                     try:
                         embeddings = []
-                        batch_size = max(1, len(texts) // 4)  # Split into 4 batches or individual texts
+                        # Calculate batch size from config or default to len/4
+                        indexing_batch_size = CONFIG["retrieval"].get("indexing_batch_size", 0)
+                        batch_size = indexing_batch_size if indexing_batch_size > 0 else max(1, len(texts) // 4)
                         
                         for i in range(0, len(texts), batch_size):
                             batch_end = min(i + batch_size, len(texts))

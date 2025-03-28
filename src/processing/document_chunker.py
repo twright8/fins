@@ -11,6 +11,7 @@ from typing import List, Dict, Any, Union, Optional
 import torch
 import re
 import gc
+import time
 
 # Add parent directory to sys.path to enable imports from project root
 sys.path.append(str(Path(__file__).resolve().parent.parent.parent))
@@ -36,7 +37,9 @@ class DocumentChunker:
         """
         self.chunk_size = CONFIG["document_processing"]["chunk_size"]
         self.chunk_overlap = CONFIG["document_processing"]["chunk_overlap"]
-        self.embedding_model_name = CONFIG["models"]["embedding_model"]
+        # Use semantic_chunking_model if specified, otherwise fall back to embedding_model
+        self.embedding_model_name = CONFIG["models"].get("semantic_chunking_model", 
+                                           CONFIG["models"]["embedding_model"])
         self.status_queue = status_queue
         
         # Use the provided model if available
@@ -236,7 +239,6 @@ class DocumentChunker:
         Returns:
             list: List of chunk dictionaries
         """
-        import time
         start_time = time.time()
         
         doc_id = document.get('document_id', 'unknown')
@@ -351,6 +353,7 @@ class DocumentChunker:
             pass
     
     def _semantic_chunking(self, text: str) -> List[str]:
+        import time
         """
         Perform semantic chunking on text using a hierarchical approach:
         1. First split by recursive text boundaries (paragraphs, sentences)
@@ -385,52 +388,54 @@ class DocumentChunker:
             large_chunk_count = sum(1 for chunk in initial_chunks if len(chunk) > self.chunk_size)
             print(f"[CHUNKING] Found {large_chunk_count} large chunks for semantic splitting")
             
+            # Initialize text_splitter once outside the loop
+            text_splitter = None
             if large_chunk_count > 0:
                 print(f"[CHUNKING] Applying semantic chunking to {large_chunk_count} large chunks")
+                
+                # Ensure model is loaded before creating the splitter
+                if self.embedding_model is None:
+                    logger.warning("Embedding model not loaded, attempting to load now")
+                    print(f"[CHUNKING] Embedding model not loaded, loading now...")
+                    self.load_model()
+                    print(f"[CHUNKING] Embedding model loaded on-demand")
+                else:
+                    logger.debug("Using pre-loaded embedding model for semantic chunking")
+                
+                # Create SemanticChunker once for all chunks
+                splitter_start = time.time()
+                print(f"[CHUNKING] Creating SemanticChunker (once) at {splitter_start:.2f}...")
+                logger.info("Creating SemanticChunker instance (once)...")
+                
+                text_splitter = SemanticChunker(
+                    self.embedding_model,
+                    breakpoint_threshold_type="percentile",
+                    breakpoint_threshold_amount=95.0
+                )
+                
+                splitter_time = time.time() - splitter_start
+                print(f"[CHUNKING] SemanticChunker created in {splitter_time:.2f}s (will be reused)")
+                logger.info(f"SemanticChunker created in {splitter_time:.2f}s (will be reused)")
             
             for i, chunk in enumerate(initial_chunks):
                 # Only apply semantic chunking to larger chunks
-                if len(chunk) > self.chunk_size:
+                if len(chunk) > self.chunk_size and text_splitter is not None:
                     try:
                         # Update on progress
                         if large_chunk_count > 1:
                             print(f"[CHUNKING] Processing large chunk {i+1}/{large_chunk_count} with semantic chunker")
-                            
-                        # Configure semantic chunker with the already loaded model
-                        # Ensure model is loaded
-                        if self.embedding_model is None:
-                            logger.warning("Embedding model not loaded, attempting to load now")
-                            print(f"[CHUNKING] Embedding model not loaded, loading now...")
-                            self.load_model()
-                            print(f"[CHUNKING] Embedding model loaded on-demand")
-                        else:
-                            logger.debug("Using pre-loaded embedding model for semantic chunking")
                         
-                        splitter_start = time.time()
-                        print(f"[CHUNKING] Creating SemanticChunker at {splitter_start:.2f}...")
-                        logger.info("Creating SemanticChunker instance...")
-                            
-                        text_splitter = SemanticChunker(
-                            self.embedding_model,
-                            breakpoint_threshold_type="percentile",
-                            breakpoint_threshold_amount=95.0
-                        )
-                        
-                        splitter_time = time.time() - splitter_start
-                        print(f"[CHUNKING] SemanticChunker created in {splitter_time:.2f}s")
-                        logger.info(f"SemanticChunker created in {splitter_time:.2f}s")
-                        
-                        # Apply semantic chunking
+                        # Apply semantic chunking with reused splitter object
                         chunking_start = time.time()
-                        print(f"[CHUNKING] Starting create_documents at {chunking_start:.2f}...")
-                        logger.info("Starting create_documents...")
+                        print(f"[CHUNKING] Starting create_documents for chunk {i+1} at {chunking_start:.2f}...")
+                        logger.info(f"Starting create_documents for chunk {i+1}...")
                         
                         docs = text_splitter.create_documents([chunk])
                         results = [doc.page_content for doc in docs]
                         
                         chunking_time = time.time() - chunking_start
-                        print(f"[CHUNKING] create_documents completed in {chunking_time:.2f}s")
-                        logger.info(f"create_documents completed in {chunking_time:.2f}s")
+                        print(f"[CHUNKING] create_documents for chunk {i+1} completed in {chunking_time:.2f}s")
+                        logger.info(f"create_documents for chunk {i+1} completed in {chunking_time:.2f}s")
                         
                         print(f"[CHUNKING] Semantic chunker split text of {len(chunk)} chars into {len(results)} chunks")
                         semantic_chunks.extend(results)
@@ -462,8 +467,13 @@ class DocumentChunker:
                 else:
                     final_chunks.append(chunk)
             
-            # Log results
+            # Log results with semantic chunker optimization info
             logger.info(f"Semantic chunking pipeline created {len(final_chunks)} chunks from text of length {len(text)}")
+            
+            if large_chunk_count > 1 and text_splitter is not None:
+                print(f"[CHUNKING] Optimization: Used a single SemanticChunker instance for {large_chunk_count} chunks")
+                logger.info(f"Optimization: Used a single SemanticChunker instance for {large_chunk_count} chunks")
+                
             print(f"[CHUNKING] Final result: {len(final_chunks)} chunks from text of length {len(text)}")
             
             return final_chunks

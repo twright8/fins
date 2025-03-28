@@ -11,6 +11,7 @@ from typing import List, Dict, Any
 
 # Add parent directory to sys.path to enable imports from project root
 sys.path.append(str(Path(__file__).resolve().parent.parent.parent))
+from src.core.config import CONFIG
 from src.utils.logger import setup_logger
 from src.utils.resource_monitor import log_memory_usage
 
@@ -244,7 +245,7 @@ class CoreferenceResolver:
 
         return modified_text
     
-    def process_chunks(self, chunks: List[Dict[str, Any]], batch_size: int = 16) -> List[Dict[str, Any]]:
+    def process_chunks(self, chunks: List[Dict[str, Any]], batch_size: int = None) -> List[Dict[str, Any]]:
         """
         Process a list of document chunks, applying coreference resolution to each in batches.
         
@@ -257,6 +258,10 @@ class CoreferenceResolver:
         """
         import time
         start_time = time.time()
+        
+        # Use configured batch size if not provided
+        if batch_size is None:
+            batch_size = CONFIG["document_processing"].get("coref_batch_size", 16)
         
         self._update_status(f"Processing {len(chunks)} chunks for coreference resolution in batches of {batch_size}")
         logger.info(f"Starting batched coreference resolution for {len(chunks)} chunks at {start_time:.2f}")

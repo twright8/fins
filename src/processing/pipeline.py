@@ -58,12 +58,42 @@ def process_documents(file_paths: List[str], status_queue: multiprocessing.Queue
             logger.info("Initializing model manager and preloading all models")
             model_manager = ModelManager(status_queue=status_queue)
             
-            model_load_start = time.time()
-            model_manager.load_all_models()
-            model_load_time = time.time() - model_load_start
+            # Progress monitoring variables
+            model_types = ["embedding_model", "coref_model", "flair_ner_model", "flair_relation_model"]
+            total_models = len(model_types)
+            models_loaded = 0
             
+            # Start loading models with progress updates
+            model_load_start = time.time()
+            
+            # Load embedding model
+            status_queue.put(('status', "Loading embedding model..."))
+            model_manager.load_embedding_model()
+            models_loaded += 1
+            status_queue.put(('progress', models_loaded/total_models * 0.15, f"Loaded embedding model ({models_loaded}/{total_models})"))
+            
+            # Load coreference model
+            status_queue.put(('status', "Loading coreference model..."))
+            model_manager.load_coref_model()
+            models_loaded += 1
+            status_queue.put(('progress', models_loaded/total_models * 0.15, f"Loaded coreference model ({models_loaded}/{total_models})"))
+            
+            # Load NER model
+            status_queue.put(('status', "Loading NER model..."))
+            model_manager.load_flair_ner_model()
+            models_loaded += 1
+            status_queue.put(('progress', models_loaded/total_models * 0.15, f"Loaded NER model ({models_loaded}/{total_models})"))
+            
+            # Load relation model
+            status_queue.put(('status', "Loading relation model..."))
+            model_manager.load_flair_relation_model()
+            models_loaded += 1
+            status_queue.put(('progress', models_loaded/total_models * 0.15, f"Loaded relation model ({models_loaded}/{total_models})"))
+            
+            model_load_time = time.time() - model_load_start
             print(f"[PIPELINE] All models loaded in {model_load_time:.2f}s")
             logger.info(f"All models loaded in {model_load_time:.2f}s")
+            status_queue.put(('status', f"All models loaded in {model_load_time:.2f}s"))
             
             # Pass models to components when initializing them
             models = model_manager.get_models()
@@ -72,7 +102,9 @@ def process_documents(file_paths: List[str], status_queue: multiprocessing.Queue
         
         # Step 1: Document Loading
         status_queue.put(('status', "Step 1/6: Document Loading"))
-        status_queue.put(('progress', 0.0, "Starting document loading"))
+        # If we preloaded models, start at 15% progress, otherwise at 0%
+        base_progress = 0.15 if preload_models else 0.0
+        status_queue.put(('progress', base_progress, "Starting document loading"))
         
         # Initialize document loader
         loader = DocumentLoader(status_queue=status_queue)
@@ -85,8 +117,9 @@ def process_documents(file_paths: List[str], status_queue: multiprocessing.Queue
                 document = loader.load_document(file_path)
                 documents.append(document)
                 
-                # Update progress
-                progress = (i + 1) / len(file_paths) * 0.2  # 0-20% progress
+                # Update progress - document loading takes 15% of total progress
+                progress_per_doc = 0.15 / len(file_paths)
+                progress = base_progress + (i + 1) * progress_per_doc
                 status_queue.put(('progress', progress, f"Loaded {i+1}/{len(file_paths)} documents"))
                 
             except Exception as e:
@@ -102,7 +135,9 @@ def process_documents(file_paths: List[str], status_queue: multiprocessing.Queue
         
         # Step 2: Document Chunking
         status_queue.put(('status', "Step 2/6: Document Chunking"))
-        status_queue.put(('progress', 0.2, "Starting document chunking"))
+        # Document loading takes 15% of progress, so chunking starts at 15% + 15% = 30%
+        chunking_base = base_progress + 0.15  # 30% if preloaded models, 15% otherwise
+        status_queue.put(('progress', chunking_base, "Starting document chunking"))
         
         # Initialize document chunker - reuse loaded model if available
         chunking_start_time = time.time()
@@ -111,10 +146,11 @@ def process_documents(file_paths: List[str], status_queue: multiprocessing.Queue
         print(f"[PIPELINE] Creating DocumentChunker instance at {time.time():.2f}")
         
         chunker_init_start = time.time()
-        embedding_model = models.get("embedding_model") if models else None
+        # Use semantic_chunking_model for the document chunker
+        semantic_chunking_model = models.get("semantic_chunking_model") if models else None
         chunker = DocumentChunker(
             status_queue=status_queue,
-            embedding_model=embedding_model
+            embedding_model=semantic_chunking_model
         )
         chunker_init_time = time.time() - chunker_init_start
         
@@ -139,8 +175,9 @@ def process_documents(file_paths: List[str], status_queue: multiprocessing.Queue
                 logger.info(f"Document {file_name} chunked in {doc_elapsed:.2f}s, produced {len(chunks)} chunks")
                 print(f"[PIPELINE] Document {file_name} chunked in {doc_elapsed:.2f}s, produced {len(chunks)} chunks")
                 
-                # Update progress
-                progress = 0.2 + (i + 1) / len(documents) * 0.2  # 20-40% progress
+                # Update progress - chunking takes 15% of total progress
+                progress_per_doc = 0.15 / len(documents)
+                progress = chunking_base + (i + 1) * progress_per_doc
                 status_queue.put(('progress', progress, f"Chunked {i+1}/{len(documents)} documents"))
                 
             except Exception as e:
@@ -178,7 +215,9 @@ def process_documents(file_paths: List[str], status_queue: multiprocessing.Queue
         
         # Step 3: Coreference Resolution
         status_queue.put(('status', "Step 3/6: Coreference Resolution"))
-        status_queue.put(('progress', 0.4, "Starting coreference resolution"))
+        # Document loading (15%) + chunking (15%) = 30% or 45% with preloaded models
+        coref_base = chunking_base + 0.15  # 45% if preloaded models, 30% otherwise
+        status_queue.put(('progress', coref_base, "Starting coreference resolution"))
         logger.info(f"Transition time before coreference resolution: {time.time() - transition_start:.2f}s")
         print(f"[PIPELINE] Starting coreference resolution with {len(all_chunks)} chunks")
         
@@ -198,12 +237,21 @@ def process_documents(file_paths: List[str], status_queue: multiprocessing.Queue
         logger.info(f"CoreferenceResolver instance created in {resolver_init_time:.2f}s")
         
         try:
-            # Process all chunks with detailed timing
+            # Process all chunks with detailed timing and progress updates
             process_chunks_start = time.time()
             print(f"[PIPELINE] Starting coreference resolution process_chunks at {process_chunks_start:.2f}")
             logger.info(f"Starting coreference process_chunks")
+            
+            # Update progress at the start of processing
+            status_queue.put(('progress', coref_base + 0.05, "Processing coreference resolution..."))
+            
+            # Call process_chunks with progress callback
             resolved_chunks = resolver.process_chunks(all_chunks)
+            
+            # Update progress at the end of processing
             process_chunks_time = time.time() - process_chunks_start
+            status_queue.put(('progress', coref_base + 0.14, "Coreference resolution completed"))
+            
             print(f"[PIPELINE] Coreference process_chunks completed in {process_chunks_time:.2f}s")
             logger.info(f"Coreference process_chunks completed in {process_chunks_time:.2f}s")
             
@@ -220,7 +268,9 @@ def process_documents(file_paths: List[str], status_queue: multiprocessing.Queue
         
         # Step 4: Entity Extraction
         status_queue.put(('status', "Step 4/6: Entity Extraction"))
-        status_queue.put(('progress', 0.6, "Starting entity extraction"))
+        # Previous steps (30% or 45%) + coreference (15%) = 45% or 60%
+        entity_base = coref_base + 0.15  # 60% if preloaded models, 45% otherwise
+        status_queue.put(('progress', entity_base, "Starting entity extraction"))
         
         # Initialize entity extractor - reuse loaded models if available
         print(f"[PIPELINE] ===== INITIALIZING ENTITY EXTRACTOR =====")
@@ -242,13 +292,20 @@ def process_documents(file_paths: List[str], status_queue: multiprocessing.Queue
         logger.info(f"EntityExtractor instance created in {extractor_init_time:.2f}s")
         
         try:
-            # Process all chunks with detailed timing
+            # Process all chunks with detailed timing and progress updates
             entity_start_time = time.time()
             print(f"[PIPELINE] ===== STARTING ENTITY EXTRACTION =====")
             print(f"[PIPELINE] Starting entity extraction process_chunks at {entity_start_time:.2f}")
             logger.info(f"Starting entity extraction process_chunks with {len(resolved_chunks)} chunks")
             
+            # Update progress at the start of processing
+            status_queue.put(('progress', entity_base + 0.05, "Processing entity extraction..."))
+            
+            # Call process_chunks
             processed_chunks, entities, relationships = extractor.process_chunks(resolved_chunks)
+            
+            # Update progress at the end of processing
+            status_queue.put(('progress', entity_base + 0.14, "Entity extraction completed"))
             
             entity_time = time.time() - entity_start_time
             print(f"[PIPELINE] Entity extraction completed in {entity_time:.2f}s")
@@ -271,14 +328,23 @@ def process_documents(file_paths: List[str], status_queue: multiprocessing.Queue
         
         # Step 5: Indexing
         status_queue.put(('status', "Step 5/6: Indexing"))
-        status_queue.put(('progress', 0.8, "Starting indexing"))
+        # Previous steps (45% or 60%) + entity extraction (15%) = 60% or 75% 
+        indexing_base = entity_base + 0.15  # 75% if preloaded models, 60% otherwise
+        status_queue.put(('progress', indexing_base, "Starting indexing"))
         
         # Initialize indexer
         indexer = Indexer(status_queue=status_queue)
         
         try:
-            # Index all chunks
+            # Index all chunks with progress updates
+            indexing_start = time.time()
+            status_queue.put(('progress', indexing_base + 0.05, "Indexing chunks..."))
+            
             success = indexer.index_chunks(processed_chunks)
+            
+            indexing_time = time.time() - indexing_start
+            status_queue.put(('progress', indexing_base + 0.14, "Indexing completed"))
+            print(f"[PIPELINE] Indexing completed in {indexing_time:.2f}s")
             
             if success:
                 logger.info("Indexing complete")

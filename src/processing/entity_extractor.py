@@ -285,13 +285,18 @@ class EntityExtractor:
             all_sentences = []
             sentence_to_chunk_map = []  # Stores tuples: (sentence_index, chunk_id, document_id)
             
+            import nltk
             from flair.data import Sentence
-            from flair.splitter import SegtokSentenceSplitter
+            
+            # Download NLTK punkt tokenizer data if not available
+            try:
+                nltk.data.find('tokenizers/punkt')
+            except LookupError:
+                nltk.download('punkt')
             
             logger.info(f"Splitting {len(chunks)} chunks into sentences for batch processing...")
             self._update_status(f"Preparing sentences for batch processing", 0.1)
             
-            splitter = SegtokSentenceSplitter()
             empty_chunk_ids = set()  # Track empty chunks
             
             # First loop: Collect all sentences from all chunks
@@ -310,14 +315,20 @@ class EntityExtractor:
                 try:
                     split_start = time.time()
                     print(f"[ENTITY] Splitting chunk {chunk_id} at {split_start:.2f}")
-                    sentences_in_chunk = splitter.split(text)
-                    print(f"[ENTITY] Split chunk {chunk_id} into {len(sentences_in_chunk)} sentences in {time.time() - split_start:.4f}s")
                     
-                    # Map each sentence to its chunk
-                    for sentence in sentences_in_chunk:
-                        current_idx = len(all_sentences)
-                        all_sentences.append(sentence)
-                        sentence_to_chunk_map.append((current_idx, chunk_id, document_id))
+                    # Use NLTK's sent_tokenize instead of Flair's splitter
+                    sentences_text = nltk.sent_tokenize(text)
+                    
+                    # Convert sentence strings to Flair Sentence objects
+                    all_sentences_flair = []
+                    for sent_text in sentences_text:
+                        if sent_text.strip():
+                            flair_sentence = Sentence(sent_text)
+                            current_idx = len(all_sentences)
+                            all_sentences.append(flair_sentence)
+                            sentence_to_chunk_map.append((current_idx, chunk_id, document_id))
+                    
+                    print(f"[ENTITY] Split chunk {chunk_id} into {len(sentences_text)} sentences in {time.time() - split_start:.4f}s")
                         
                 except Exception as e:
                     logger.error(f"Error splitting chunk {chunk_id}: {e}")
@@ -329,9 +340,9 @@ class EntityExtractor:
             
             # 2. Batch Prediction with Flair
             if all_sentences:
-                # Configure batch sizes
-                ner_batch_size = 64  # Adjust based on VRAM
-                re_batch_size = 32   # Adjust based on VRAM
+                # Configure batch sizes from config
+                ner_batch_size = CONFIG["entity_extraction"].get("ner_batch_size", 64)  # Default to 64 if not in config
+                re_batch_size = CONFIG["entity_extraction"].get("relation_batch_size", 32)  # Default to 32 if not in config
                 
                 # Predict named entities in batches
                 ner_start_time = time.time()
@@ -585,14 +596,18 @@ class EntityExtractor:
         Returns:
             tuple: (annotated_text, entities, relationships)
         """
+        import nltk
         from flair.data import Sentence
-        from flair.splitter import SegtokSentenceSplitter
-        
-        splitter = SegtokSentenceSplitter()
         
         try:
-            # Split text into sentences
-            sentences = splitter.split(text)
+            nltk.data.find('tokenizers/punkt')
+        except LookupError:
+            nltk.download('punkt')
+        
+        try:
+            # Split text into sentences using NLTK
+            sentences_text = nltk.sent_tokenize(text)
+            sentences = [Sentence(sent_text) for sent_text in sentences_text if sent_text.strip()]
             
             # Initialize results
             entities = []

@@ -4,13 +4,18 @@ document_processing:
   chunk_size: 512
   chunk_overlap: 50
   ocr_parallel_jobs: 4
+  coref_batch_size: 256  # Batch size for coreference resolution
 
 # Models
 models:
+  # Retrieval and indexing embedding model
   embedding_model: "intfloat/multilingual-e5-base"
+  # Semantic chunking embedding model (can be the same or different)
+  semantic_chunking_model: "intfloat/multilingual-e5-small"
+  # Other models
   reranking_model: "BAAI/bge-reranker-v2-m3"
   ner_model: "flair/ner-english-ontonotes-fast"
-  coref_model: "maverick-coref"
+  coref_model: "FCoref"
   llm_model: "Qwen/Qwen2.5-0.5B-Instruct"
 
 # Retrieval
@@ -21,6 +26,7 @@ retrieval:
   top_k_rerank: 5
   vector_weight: 0.7
   bm25_weight: 0.3
+  indexing_batch_size: 0  # 0 means auto (len/4)
 
 # LLM Generation
 generation:
@@ -60,6 +66,8 @@ entity_extraction:
   confidence_threshold: 0.3
   relationship_threshold: 0.3
   fuzzy_match_threshold: 90  # Fuzzy matching threshold (0-100) for entity deduplication
+  ner_batch_size: 64  # Batch size for NER predictions (adjust based on VRAM)
+  relation_batch_size: 32  # Batch size for relationship predictions
 
 # UI
 ui:
